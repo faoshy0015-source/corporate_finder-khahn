@@ -29,7 +29,7 @@ st.set_page_config(
 )
 
 st.title("🏢 법인 Finder")
-st.caption("법인명 + 본점/사업장 소재지 검색 · OpenDART 감사보고서/거래은행·차입금 분석 · v2.8")
+st.caption("법인명 + 본점/사업장 소재지 검색 · OpenDART 감사보고서/거래은행·차입금 분석 · v2.9 AWS Seoul")
 
 DART_BASE = "https://opendart.fss.or.kr/api"
 DART_ENG_BASE = "https://engopendart.fss.or.kr/engapi"
@@ -202,7 +202,7 @@ def get_dart_default_session():
     adapter = HTTPAdapter(max_retries=_retry_policy())
     session.mount("https://", adapter)
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 Corporate-Finder/2.8",
+        "User-Agent": "Mozilla/5.0 Corporate-Finder/2.9",
         "Accept": "*/*",
         "Connection": "keep-alive",
     })
@@ -216,7 +216,7 @@ def get_dart_primary_session():
     adapter = HTTPAdapter(max_retries=Retry(total=0, connect=0, read=0, redirect=0))
     session.mount("https://", adapter)
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 Corporate-Finder/2.8",
+        "User-Agent": "Mozilla/5.0 Corporate-Finder/2.9",
         "Accept": "*/*",
         "Connection": "keep-alive",
     })
@@ -229,7 +229,7 @@ def get_dart_legacy_session():
     adapter = DARTSSLAdapter(max_retries=_retry_policy())
     session.mount("https://opendart.fss.or.kr/", adapter)
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 Corporate-Finder/2.8",
+        "User-Agent": "Mozilla/5.0 Corporate-Finder/2.9",
         "Accept": "*/*",
         "Connection": "keep-alive",
     })
@@ -353,7 +353,7 @@ RELATED_WORDS = [
 # 유틸리티
 # =========================================================
 def get_secret(name, default=""):
-    # Streamlit Cloud: st.secrets / 로컬: st.secrets 또는 환경변수 모두 지원
+    # AWS/systemd: 환경변수 / 로컬 개발: st.secrets 또는 환경변수 모두 지원
     try:
         value = st.secrets.get(name, None)
         if value not in (None, ""):
@@ -361,6 +361,17 @@ def get_secret(name, default=""):
     except Exception:
         pass
     return os.getenv(name, default)
+
+
+def safe_error_text(exc) -> str:
+    """오류 메시지에서 DART 인증키/쿼리스트링 민감값을 제거한다."""
+    msg = str(exc)
+    key = str(globals().get("api_key", "") or os.getenv("DART_API_KEY", "")).strip()
+    if key:
+        msg = msg.replace(key, "***MASKED***")
+    msg = re.sub(r"(?i)(crtfc_key=)[^&\s'\"<>]+", r"\1***MASKED***", msg)
+    msg = re.sub(r"(?i)(DART_API_KEY\s*[=:]\s*)[^\s'\"<>]+", r"\1***MASKED***", msg)
+    return msg
 
 
 def normalize_company_name(name: str) -> str:
@@ -1349,15 +1360,15 @@ try:
     with st.spinner("DART 법인 목록을 불러오는 중입니다..."):
         corp_df = load_corp_codes(api_key)
 except Exception as e:
-    st.error(f"DART 연결 실패: {type(e).__name__}: {e}")
-    st.info("v2.8은 국문 OpenDART 연결이 타임아웃되면 금융감독원 공식 영문 OpenDART API로 자동 우회합니다. 두 공식 도메인 모두 연결되지 않으면 Streamlit Community Cloud의 해외 네트워크 경로 문제일 가능성이 높습니다.")
+    st.error(f"DART 연결 실패: {type(e).__name__}: {safe_error_text(e)}")
+    st.info("AWS 서울 리전에서는 국문 OpenDART를 우선 사용하고, 연결 오류 시 공식 영문 OpenDART로 자동 재시도합니다. API 키는 오류 화면에 노출되지 않도록 마스킹됩니다.")
     st.stop()
 
 try:
     init_local_db()
     sync_corp_master(corp_df)
 except Exception as e:
-    st.error(f"로컬 주소 DB 초기화 실패: {e}")
+    st.error(f"로컬 주소 DB 초기화 실패: {safe_error_text(e)}")
     st.stop()
 
 
@@ -1409,7 +1420,7 @@ with name_tab:
                         result = analyze_company(api_key, selected)
                     st.session_state["single_result"] = result
                 except Exception as e:
-                    st.error(f"분석 중 오류: {e}")
+                    st.error(f"분석 중 오류: {safe_error_text(e)}")
 
     result = st.session_state.get("single_result")
     if result:
@@ -1527,7 +1538,7 @@ with region_tab:
                     st.session_state["external_file_sig"] = file_sig
                     st.session_state["external_mapped_cols"] = mapped
                 except Exception as e:
-                    st.error(f"외부 기업목록 읽기 실패: {e}")
+                    st.error(f"외부 기업목록 읽기 실패: {safe_error_text(e)}")
             if "external_company_df" in st.session_state:
                 st.success(f"외부 기업목록 {len(st.session_state['external_company_df']):,}개 불러옴")
                 with st.expander("인식된 열 확인"):
@@ -1676,7 +1687,7 @@ with region_tab:
                         except Exception:
                             pass
                     except Exception as e:
-                        st.error(f"분석 중 오류: {e}")
+                        st.error(f"분석 중 오류: {safe_error_text(e)}")
 
         rr = st.session_state.get("region_analysis_result")
         if rr:
@@ -1911,7 +1922,7 @@ with db_tab:
             st.success(f"주소 DB {count:,}건을 복원했습니다.")
             st.rerun()
         except Exception as e:
-            st.error(f"복원 실패: {e}")
+            st.error(f"복원 실패: {safe_error_text(e)}")
 
 
 st.divider()
