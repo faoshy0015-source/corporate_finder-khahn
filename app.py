@@ -29,9 +29,10 @@ st.set_page_config(
 )
 
 st.title("🏢 법인 Finder")
-st.caption("법인명 + 본점/사업장 소재지 검색 · OpenDART 감사보고서/거래은행·차입금 분석 · v2.7")
+st.caption("법인명 + 본점/사업장 소재지 검색 · OpenDART 감사보고서/거래은행·차입금 분석 · v2.8")
 
 DART_BASE = "https://opendart.fss.or.kr/api"
+DART_ENG_BASE = "https://engopendart.fss.or.kr/engapi"
 DB_PATH = Path(os.getenv("CORP_FINDER_DB", "corp_finder_cache.sqlite3"))
 
 
@@ -201,7 +202,21 @@ def get_dart_default_session():
     adapter = HTTPAdapter(max_retries=_retry_policy())
     session.mount("https://", adapter)
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 Corporate-Finder/2.7",
+        "User-Agent": "Mozilla/5.0 Corporate-Finder/2.8",
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+    })
+    return session
+
+
+@st.cache_resource
+def get_dart_primary_session():
+    """국문 DART 1차 연결용: Cloud에서 막혀 있을 때 오래 대기하지 않도록 재시도하지 않음."""
+    session = requests.Session()
+    adapter = HTTPAdapter(max_retries=Retry(total=0, connect=0, read=0, redirect=0))
+    session.mount("https://", adapter)
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 Corporate-Finder/2.8",
         "Accept": "*/*",
         "Connection": "keep-alive",
     })
@@ -214,73 +229,123 @@ def get_dart_legacy_session():
     adapter = DARTSSLAdapter(max_retries=_retry_policy())
     session.mount("https://opendart.fss.or.kr/", adapter)
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 Corporate-Finder/2.7",
+        "User-Agent": "Mozilla/5.0 Corporate-Finder/2.8",
         "Accept": "*/*",
         "Connection": "keep-alive",
     })
     return session
 
 
+def _to_eng_dart_url(url: str) -> str:
+    """국문 OpenDART API URL을 공식 영문 OpenDART API URL로 변환."""
+    if not isinstance(url, str):
+        return url
+    if url.startswith("https://opendart.fss.or.kr/api/"):
+        return url.replace(
+            "https://opendart.fss.or.kr/api/",
+            "https://engopendart.fss.or.kr/engapi/",
+            1,
+        )
+    return url
+
+
 def dart_get(url, **kwargs):
+    """OpenDART 연결.
+
+    1) 국문 API 우선
+    2) Windows DH_KEY_TOO_SMALL이면 로컬 SSL 호환모드 재시도
+    3) Streamlit Cloud 등에서 국문 도메인 ConnectTimeout/ConnectionError가 나면
+       금융감독원 공식 영문 OpenDART(engopendart)로 자동 우회
+    """
+    primary_kwargs = dict(kwargs)
+    # Streamlit Cloud처럼 국문 DART 경로가 차단된 경우 60~90초씩 기다리지 않게
+    # 연결(connect) 단계만 8초로 제한하고, 응답(read) 대기시간은 기존 값을 유지합니다.
+    if url.startswith("https://opendart.fss.or.kr/api/"):
+        t = primary_kwargs.get("timeout", 30)
+        if isinstance(t, (int, float)):
+            primary_kwargs["timeout"] = (8, t)
     try:
-        return get_dart_default_session().get(url, **kwargs)
+        return get_dart_primary_session().get(url, **primary_kwargs)
     except requests.exceptions.SSLError as e:
         msg = str(e).upper()
         if "DH_KEY_TOO_SMALL" in msg or "DH KEY TOO SMALL" in msg:
-            return get_dart_legacy_session().get(url, **kwargs)
+            try:
+                return get_dart_legacy_session().get(url, **kwargs)
+            except (requests.exceptions.ConnectTimeout, requests.exceptions.ConnectionError):
+                eng_url = _to_eng_dart_url(url)
+                if eng_url != url:
+                    return get_dart_default_session().get(eng_url, **kwargs)
+                raise
+        raise
+    except (requests.exceptions.ConnectTimeout, requests.exceptions.ConnectionError):
+        eng_url = _to_eng_dart_url(url)
+        if eng_url != url:
+            return get_dart_default_session().get(eng_url, **kwargs)
         raise
 
 BANK_PATTERNS = {
     "하나은행": [
-        r"하나은행", r"KEB\s*하나은행", r"KEB하나", r"㈜하나은행", r"\(주\)하나은행"
+        r"하나은행", r"KEB\s*하나은행", r"KEB하나", r"㈜하나은행", r"\(주\)하나은행",
+        r"Hana\s*Bank", r"KEB\s*Hana\s*Bank"
     ],
     "KB국민은행": [
-        r"KB\s*국민은행", r"국민은행", r"㈜국민은행", r"\(주\)국민은행"
+        r"KB\s*국민은행", r"국민은행", r"㈜국민은행", r"\(주\)국민은행",
+        r"KB\s*Kookmin\s*Bank", r"Kookmin\s*Bank"
     ],
-    "신한은행": [r"신한은행", r"㈜신한은행", r"\(주\)신한은행"],
-    "우리은행": [r"우리은행", r"㈜우리은행", r"\(주\)우리은행"],
+    "신한은행": [r"신한은행", r"㈜신한은행", r"\(주\)신한은행", r"Shinhan\s*Bank"],
+    "우리은행": [r"우리은행", r"㈜우리은행", r"\(주\)우리은행", r"Woori\s*Bank"],
     "NH농협은행": [
-        r"NH\s*농협은행", r"농협은행", r"농협중앙회", r"NH농협"
+        r"NH\s*농협은행", r"농협은행", r"농협중앙회", r"NH농협",
+        r"NH\s*NongHyup\s*Bank", r"NongHyup\s*Bank", r"National\s*Agricultural\s*Cooperative"
     ],
     "IBK기업은행": [
-        r"IBK\s*기업은행", r"기업은행", r"중소기업은행"
+        r"IBK\s*기업은행", r"기업은행", r"중소기업은행",
+        r"Industrial\s*Bank\s*of\s*Korea", r"IBK"
     ],
     "KDB산업은행": [
-        r"KDB\s*산업은행", r"산업은행", r"한국산업은행"
+        r"KDB\s*산업은행", r"산업은행", r"한국산업은행",
+        r"Korea\s*Development\s*Bank", r"KDB"
     ],
     "SC제일은행": [
-        r"SC\s*제일은행", r"제일은행", r"스탠다드차타드은행", r"한국스탠다드차타드은행"
+        r"SC\s*제일은행", r"제일은행", r"스탠다드차타드은행", r"한국스탠다드차타드은행",
+        r"Standard\s*Chartered\s*Bank\s*Korea", r"Standard\s*Chartered"
     ],
-    "한국씨티은행": [r"한국씨티은행", r"씨티은행"],
-    "iM뱅크(구 대구은행)": [r"iM뱅크", r"아이엠뱅크", r"대구은행"],
-    "BNK부산은행": [r"BNK\s*부산은행", r"부산은행"],
-    "BNK경남은행": [r"BNK\s*경남은행", r"경남은행"],
-    "광주은행": [r"광주은행"],
-    "전북은행": [r"전북은행"],
-    "제주은행": [r"제주은행"],
-    "Sh수협은행": [r"Sh\s*수협은행", r"수협은행"],
+    "한국씨티은행": [r"한국씨티은행", r"씨티은행", r"Citibank\s*Korea", r"Citibank"],
+    "iM뱅크(구 대구은행)": [r"iM뱅크", r"아이엠뱅크", r"대구은행", r"iM\s*Bank", r"Daegu\s*Bank"],
+    "BNK부산은행": [r"BNK\s*부산은행", r"부산은행", r"Busan\s*Bank"],
+    "BNK경남은행": [r"BNK\s*경남은행", r"경남은행", r"Kyongnam\s*Bank", r"Gyeongnam\s*Bank"],
+    "광주은행": [r"광주은행", r"Kwangju\s*Bank", r"Gwangju\s*Bank"],
+    "전북은행": [r"전북은행", r"Jeonbuk\s*Bank"],
+    "제주은행": [r"제주은행", r"Jeju\s*Bank"],
+    "Sh수협은행": [r"Sh\s*수협은행", r"수협은행", r"Suhyup\s*Bank", r"National\s*Federation\s*of\s*Fisheries"],
 }
 
 CATEGORY_PATTERNS = {
     "차입/대출": [
         r"차입금", r"단기차입", r"장기차입", r"대출", r"시설자금",
-        r"운전자금", r"일반자금", r"한도대출"
+        r"운전자금", r"일반자금", r"한도대출",
+        r"borrowings?", r"loan", r"credit\s*line", r"working\s*capital", r"facility"
     ],
     "담보/질권": [
-        r"담보", r"근저당", r"질권", r"담보제공", r"담보설정"
+        r"담보", r"근저당", r"질권", r"담보제공", r"담보설정",
+        r"collateral", r"pledge", r"mortgage", r"security\s*interest"
     ],
     "예금": [
-        r"예금", r"정기예금", r"사용제한", r"금융상품", r"예치금"
+        r"예금", r"정기예금", r"사용제한", r"금융상품", r"예치금",
+        r"deposit", r"restricted\s*deposit", r"financial\s*instrument"
     ],
     "보증/약정": [
-        r"지급보증", r"보증", r"약정", r"한도약정", r"신용장", r"외화"
+        r"지급보증", r"보증", r"약정", r"한도약정", r"신용장", r"외화",
+        r"guarantee", r"commitment", r"letter\s*of\s*credit", r"credit\s*facility"
     ],
 }
 
 RELATED_WORDS = [
     "은행", "금융기관", "차입금", "단기차입금", "장기차입금",
     "담보", "질권", "예금", "정기예금", "사용제한예금",
-    "대출", "지급보증", "한도약정", "약정"
+    "대출", "지급보증", "한도약정", "약정",
+    "bank", "financial institution", "borrowing", "loan", "collateral",
+    "pledge", "deposit", "guarantee", "commitment", "credit facility"
 ]
 
 
@@ -975,8 +1040,11 @@ def pick_latest_audit_report(disclosures: pd.DataFrame):
         return None
 
     df = disclosures.copy()
-    # "감사보고서", "[기재정정]감사보고서" 등 포함
-    mask = df["report_nm"].astype(str).str.contains("감사보고서", na=False)
+    # 국문/영문 OpenDART 모두 지원
+    audit_pattern = r"감사보고서|audit\s*report|auditor['’]?s?\s*report|independent\s*auditor"
+    mask = df["report_nm"].astype(str).str.contains(
+        audit_pattern, case=False, na=False, regex=True
+    )
     audit = df[mask].copy()
 
     if audit.empty:
@@ -1282,7 +1350,7 @@ try:
         corp_df = load_corp_codes(api_key)
 except Exception as e:
     st.error(f"DART 연결 실패: {type(e).__name__}: {e}")
-    st.info("로컬에서는 정상인데 Streamlit Cloud에서만 실패하면, App settings → Secrets의 DART_API_KEY가 현재 배포 앱에도 저장되어 있는지 확인한 뒤 Reboot app 해주세요. 이 버전은 Cloud에서는 기본 TLS를 사용하고, Windows의 DH_KEY_TOO_SMALL 오류가 있을 때만 SSL 호환 모드로 자동 재시도합니다.")
+    st.info("v2.8은 국문 OpenDART 연결이 타임아웃되면 금융감독원 공식 영문 OpenDART API로 자동 우회합니다. 두 공식 도메인 모두 연결되지 않으면 Streamlit Community Cloud의 해외 네트워크 경로 문제일 가능성이 높습니다.")
     st.stop()
 
 try:
