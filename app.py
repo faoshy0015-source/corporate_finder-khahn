@@ -14,6 +14,7 @@ import pandas as pd
 import requests
 import streamlit as st
 from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from urllib3.poolmanager import PoolManager
 from bs4 import BeautifulSoup
 
@@ -28,7 +29,7 @@ st.set_page_config(
 )
 
 st.title("🏢 법인 Finder")
-st.caption("법인명 + 본점/사업장 소재지 검색 · OpenDART 감사보고서/거래은행·차입금 분석 · v2.6")
+st.caption("법인명 + 본점/사업장 소재지 검색 · OpenDART 감사보고서/거래은행·차입금 분석 · v2.7")
 
 DART_BASE = "https://opendart.fss.or.kr/api"
 DB_PATH = Path(os.getenv("CORP_FINDER_DB", "corp_finder_cache.sqlite3"))
@@ -163,12 +164,11 @@ def render_bank_analysis(banks, title="🏦 감사보고서에서 확인된 거�
 
 
 # =========================================================
-# OpenDART 전용 SSL 호환 설정
+# OpenDART HTTPS 연결 설정 (로컬 + Streamlit Cloud 호환)
 # =========================================================
-# 일부 회사망 / Python 3.13 + OpenSSL 환경에서는
-# OpenDART HTTPS 연결 시 [SSL: DH_KEY_TOO_SMALL] 오류가 발생할 수 있습니다.
-# 아래 설정은 OpenDART 요청에만 OpenSSL 보안 레벨을 1로 낮춰
-# 호환성을 확보합니다. 인증서 검증 자체는 끄지 않습니다.
+# Streamlit Cloud/Linux에서는 기본 TLS 연결이 정상인 경우가 많고,
+# 일부 Windows/Python 3.13 환경에서만 DH_KEY_TOO_SMALL 오류가 발생할 수 있습니다.
+# 따라서 기본 TLS를 먼저 사용하고, 해당 SSL 오류일 때만 호환 모드로 재시도합니다.
 
 class DARTSSLAdapter(HTTPAdapter):
     def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
@@ -183,16 +183,52 @@ class DARTSSLAdapter(HTTPAdapter):
         )
 
 
+def _retry_policy():
+    return Retry(
+        total=3,
+        connect=3,
+        read=3,
+        backoff_factor=0.7,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET"]),
+        raise_on_status=False,
+    )
+
+
 @st.cache_resource
-def get_dart_session():
+def get_dart_default_session():
     session = requests.Session()
-    session.mount("https://opendart.fss.or.kr/", DARTSSLAdapter())
-    session.headers.update({"User-Agent": "Corporate-Finder/1.1"})
+    adapter = HTTPAdapter(max_retries=_retry_policy())
+    session.mount("https://", adapter)
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 Corporate-Finder/2.7",
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+    })
+    return session
+
+
+@st.cache_resource
+def get_dart_legacy_session():
+    session = requests.Session()
+    adapter = DARTSSLAdapter(max_retries=_retry_policy())
+    session.mount("https://opendart.fss.or.kr/", adapter)
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 Corporate-Finder/2.7",
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+    })
     return session
 
 
 def dart_get(url, **kwargs):
-    return get_dart_session().get(url, **kwargs)
+    try:
+        return get_dart_default_session().get(url, **kwargs)
+    except requests.exceptions.SSLError as e:
+        msg = str(e).upper()
+        if "DH_KEY_TOO_SMALL" in msg or "DH KEY TOO SMALL" in msg:
+            return get_dart_legacy_session().get(url, **kwargs)
+        raise
 
 BANK_PATTERNS = {
     "하나은행": [
@@ -252,10 +288,14 @@ RELATED_WORDS = [
 # 유틸리티
 # =========================================================
 def get_secret(name, default=""):
+    # Streamlit Cloud: st.secrets / 로컬: st.secrets 또는 환경변수 모두 지원
     try:
-        return st.secrets.get(name, default)
+        value = st.secrets.get(name, None)
+        if value not in (None, ""):
+            return value
     except Exception:
-        return default
+        pass
+    return os.getenv(name, default)
 
 
 def normalize_company_name(name: str) -> str:
@@ -1227,8 +1267,11 @@ if APP_PASSWORD:
 api_key = str(get_secret("DART_API_KEY", "")).strip()
 
 if not api_key:
-    st.error("DART API 키가 설정되지 않았습니다. Streamlit Cloud의 Settings → Secrets에 `DART_API_KEY`를 등록한 뒤 앱을 재실행해 주세요.")
+    st.error("DART API 키가 설정되지 않았습니다. Streamlit Cloud의 App settings → Secrets에 `DART_API_KEY = \"발급받은키\"`를 등록한 뒤 Reboot app 해주세요.")
     st.stop()
+
+if len(api_key) != 40:
+    st.warning(f"DART API 키 길이가 일반적인 40자리와 다릅니다. 현재 {len(api_key)}자리입니다. Secrets 값에 따옴표 외의 공백/문자가 들어갔는지 확인해 주세요.")
 
 
 # =========================================================
@@ -1238,7 +1281,8 @@ try:
     with st.spinner("DART 법인 목록을 불러오는 중입니다..."):
         corp_df = load_corp_codes(api_key)
 except Exception as e:
-    st.error(f"DART 연결 실패: {e}")
+    st.error(f"DART 연결 실패: {type(e).__name__}: {e}")
+    st.info("로컬에서는 정상인데 Streamlit Cloud에서만 실패하면, App settings → Secrets의 DART_API_KEY가 현재 배포 앱에도 저장되어 있는지 확인한 뒤 Reboot app 해주세요. 이 버전은 Cloud에서는 기본 TLS를 사용하고, Windows의 DH_KEY_TOO_SMALL 오류가 있을 때만 SSL 호환 모드로 자동 재시도합니다.")
     st.stop()
 
 try:
