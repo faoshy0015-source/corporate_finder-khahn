@@ -29,7 +29,7 @@ st.set_page_config(
 )
 
 st.title("🏢 법인 Finder")
-st.caption("법인명 + 본점/사업장 소재지 검색 · OpenDART 감사보고서/거래은행·차입금 분석 · v2.9 AWS Seoul")
+st.caption("법인명 + 본점/사업장 소재지 검색 · OpenDART 감사보고서/거래은행·차입금 분석 · 퇴직연금 분석 · v2.9")
 
 DART_BASE = "https://opendart.fss.or.kr/api"
 DART_ENG_BASE = "https://engopendart.fss.or.kr/engapi"
@@ -202,7 +202,7 @@ def get_dart_default_session():
     adapter = HTTPAdapter(max_retries=_retry_policy())
     session.mount("https://", adapter)
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 Corporate-Finder/2.9",
+        "User-Agent": "Mozilla/5.0 Corporate-Finder/2.8",
         "Accept": "*/*",
         "Connection": "keep-alive",
     })
@@ -216,7 +216,7 @@ def get_dart_primary_session():
     adapter = HTTPAdapter(max_retries=Retry(total=0, connect=0, read=0, redirect=0))
     session.mount("https://", adapter)
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 Corporate-Finder/2.9",
+        "User-Agent": "Mozilla/5.0 Corporate-Finder/2.8",
         "Accept": "*/*",
         "Connection": "keep-alive",
     })
@@ -229,7 +229,7 @@ def get_dart_legacy_session():
     adapter = DARTSSLAdapter(max_retries=_retry_policy())
     session.mount("https://opendart.fss.or.kr/", adapter)
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 Corporate-Finder/2.9",
+        "User-Agent": "Mozilla/5.0 Corporate-Finder/2.8",
         "Accept": "*/*",
         "Connection": "keep-alive",
     })
@@ -353,7 +353,7 @@ RELATED_WORDS = [
 # 유틸리티
 # =========================================================
 def get_secret(name, default=""):
-    # AWS/systemd: 환경변수 / 로컬 개발: st.secrets 또는 환경변수 모두 지원
+    # Streamlit Cloud: st.secrets / 로컬: st.secrets 또는 환경변수 모두 지원
     try:
         value = st.secrets.get(name, None)
         if value not in (None, ""):
@@ -361,17 +361,6 @@ def get_secret(name, default=""):
     except Exception:
         pass
     return os.getenv(name, default)
-
-
-def safe_error_text(exc) -> str:
-    """오류 메시지에서 DART 인증키/쿼리스트링 민감값을 제거한다."""
-    msg = str(exc)
-    key = str(globals().get("api_key", "") or os.getenv("DART_API_KEY", "")).strip()
-    if key:
-        msg = msg.replace(key, "***MASKED***")
-    msg = re.sub(r"(?i)(crtfc_key=)[^&\s'\"<>]+", r"\1***MASKED***", msg)
-    msg = re.sub(r"(?i)(DART_API_KEY\s*[=:]\s*)[^\s'\"<>]+", r"\1***MASKED***", msg)
-    return msg
 
 
 def normalize_company_name(name: str) -> str:
@@ -1113,6 +1102,95 @@ def download_disclosure_text(api_key: str, rcept_no: str) -> str:
 
 
 # =========================================================
+# 퇴직연금 / 퇴직급여 공시 분석 (v2.9)
+# =========================================================
+PENSION_SIGNALS = {
+    "DB형": [r"확정급여(?:형|제도|채무|부채)", r"사외적립자산", r"순확정급여", r"defined\s+benefit", r"plan\s+assets"],
+    "DC형": [r"확정기여(?:형|제도)", r"defined\s+contribution"],
+    "퇴직연금": [r"퇴직연금", r"퇴직급여", r"퇴직급여충당", r"종업원급여", r"employee\s+benefits?", r"retirement\s+benefits?"],
+}
+PENSION_AMOUNT_PATTERNS = {
+    "사외적립자산": [r"사외적립자산", r"적립자산의\s*공정가치", r"fair\s+value\s+of\s+plan\s+assets", r"plan\s+assets"],
+    "확정급여채무": [r"확정급여채무", r"확정급여채무의\s*현재가치", r"present\s+value\s+of\s+defined\s+benefit"],
+    "순확정급여부채": [r"순확정급여부채", r"net\s+defined\s+benefit\s+liabilit"],
+    "DC 부담금/비용": [r"확정기여제도.*(?:비용|납입|부담금)", r"contribution\s+expense"],
+}
+PENSION_EXTRA_TERMS = [r"퇴직연금사업자", r"퇴직연금운용기관", r"퇴직연금운용자산", r"연금자산", r"연금신탁"]
+
+
+def analyze_pension_text(raw_text: str) -> dict:
+    """원문 공시 내 근거 탐색. 표 단위·금액 열 연계가 확실하지 않으면 임의 금액 추출 금지."""
+    blocks = [re.sub(r"\s+", " ", x).strip() for x in re.split(r"\n+", raw_text or "") if x.strip()]
+    signals = {k: [] for k in PENSION_SIGNALS}
+    amounts = {k: [] for k in PENSION_AMOUNT_PATTERNS}
+    institution_evidence = []
+    retirement_words = re.compile(r"퇴직연금|사외적립|확정급여|확정기여|연금운용|pension|retirement|plan\s+assets|defined\s+(?:benefit|contribution)", re.I)
+    for i, line in enumerate(blocks):
+        # 제목, 행/값이 다른 줄에 나뉜 경우 앞뒤 문장을 원문 그대로 첨부
+        if not retirement_words.search(line):
+            continue
+        context = " | ".join(blocks[max(0,i-1):min(len(blocks),i+3)])[:700]
+        for category, patterns in PENSION_SIGNALS.items():
+            if any(re.search(p, line, re.I) for p in patterns) and context not in signals[category] and len(signals[category])<7:
+                signals[category].append(context)
+        for field, patterns in PENSION_AMOUNT_PATTERNS.items():
+            if any(re.search(p, line, re.I) for p in patterns) and context not in amounts[field] and len(amounts[field])<6:
+                amounts[field].append(context)
+        # 기관명은 금융기관 이름과 연금 문맥이 같은 좁은 범위에 존재할 때만 '후보'로 표시
+        for bank, patterns in BANK_PATTERNS.items():
+            if re.search("|".join(f"(?:{v})" for v in patterns), line, re.I):
+                if re.search(r"퇴직연금|연금사업자|연금신탁|사외적립|pension|retirement", line, re.I):
+                    item={"금융기관":bank,"판정":"연금 관련 문맥에 기관명 병기(역할 확인 필요)","근거":context}
+                    if item not in institution_evidence:
+                        institution_evidence.append(item)
+    db = bool(signals["DB형"])
+    dc = bool(signals["DC형"])
+    if db and dc:
+        status="DB형·DC형 관련 공시 모두 확인"
+    elif db:
+        status="DB형 관련 공시 확인"
+    elif dc:
+        status="DC형 관련 공시 확인"
+    elif signals["퇴직연금"]:
+        status="퇴직급여 관련 공시 확인 · 유형 불명"
+    else:
+        status="공시 근거 미확인"
+    return {"판정": status, "DB근거": signals["DB형"], "DC근거": signals["DC형"],
+            "일반근거":signals["퇴직연금"], "금액관련근거":amounts,
+            "연금기관후보":institution_evidence[:12],
+            "안내":"DART 공개문서 기반 단서이며 실제 제도 가입·계좌별 적립금·수탁/운용기관을 확정하지 않습니다. 표의 단위·기준일·열 구성을 원문에서 확인하세요."}
+
+
+def render_pension_analysis(pension: dict):
+    st.markdown("### 🏦 퇴직연금·퇴직급여 공시 분석")
+    st.metric("퇴직연금 분석 결과", pension.get("판정", "공시 근거 미확인"))
+    st.caption(pension.get("안내", ""))
+    for label, key in [("DB형 관련 근거", "DB근거"),("DC형 관련 근거", "DC근거"),("기타 퇴직급여 근거", "일반근거")]:
+        rows=pension.get(key) or []
+        if rows:
+            with st.expander(f"{label} ({len(rows)}건)", expanded=(key=="DB근거")):
+                for row in rows:
+                    st.info(row)
+    with st.expander("사외적립자산·급여채무·DC부담금 관련 원문 (금액 검증용)"):
+        found=False
+        for label, rows in (pension.get("금액관련근거") or {}).items():
+            if rows:
+                found=True
+                st.markdown(f"**{label}**")
+                for row in rows:
+                    st.write("• "+row)
+        if not found:
+            st.info("관련 금액 근거를 발견하지 못했습니다.")
+    institutions=pension.get("연금기관후보") or []
+    if institutions:
+        st.markdown("#### 연금 관련 금융기관명 후보 · 원문 확인 필요")
+        st.dataframe(pd.DataFrame(institutions),use_container_width=True,hide_index=True)
+    else:
+        st.caption("퇴직연금 운용 금융기관은 공개 원문에서 직접 연결되는 근거를 확인하지 못했습니다.")
+    st.caption("영업 활용: 담당자에게 DB/DC 제도, 사업자, 적립 규모, 추가 납입 계획을 확인한 뒤 유치 가능성을 판단하세요.")
+
+
+# =========================================================
 # 분석
 # =========================================================
 def bank_hits_in_text(text: str):
@@ -1239,12 +1317,14 @@ def analyze_company(api_key: str, corp_row: dict):
             "report": None,
             "banks": [],
             "generic": [],
+            "pension": analyze_pension_text(""),
             "error": "최근 5년 공시에서 '감사보고서'를 찾지 못했습니다.",
         }
 
     rcept_no = str(report.get("rcept_no", ""))
     text = download_disclosure_text(api_key, rcept_no)
     banks, generic = bank_hits_in_text(text)
+    pension = analyze_pension_text(text)
 
     report_info = {
         "보고서명": report.get("report_nm", ""),
@@ -1258,6 +1338,7 @@ def analyze_company(api_key: str, corp_row: dict):
         "report": report_info,
         "banks": banks,
         "generic": generic,
+        "pension": pension,
         "error": "",
     }
 
@@ -1268,6 +1349,8 @@ def make_excel(results):
     summary_rows = []
     bank_rows = []
     evidence_rows = []
+    pension_rows = []
+    pension_evidence_rows = []
 
     for result in results:
         c = result["company"]
@@ -1281,6 +1364,17 @@ def make_excel(results):
             "확인은행수": len(result.get("banks", [])),
             "오류/비고": result.get("error", ""),
         })
+
+        pen=result.get("pension") or {}
+        pension_rows.append({"법인명":c.get("법인명", ""), "퇴직연금판정":pen.get("판정", "분석자료 없음"),
+                             "연금기관명후보":", ".join(x.get("금융기관", "") for x in pen.get("연금기관후보",[])),
+                             "DART링크":report.get("DART링크", "")})
+        for category, key in [("DB형", "DB근거"),("DC형", "DC근거"),("퇴직급여", "일반근거")]:
+            for evidence in pen.get(key, []):
+                pension_evidence_rows.append({"법인명":c.get("법인명", ""),"항목":category,"근거원문":evidence})
+        for category, evidences in (pen.get("금액관련근거") or {}).items():
+            for evidence in evidences:
+                pension_evidence_rows.append({"법인명":c.get("법인명", ""),"항목":category,"근거원문":evidence})
 
         for b in result.get("banks", []):
             bank_rows.append({
@@ -1302,6 +1396,8 @@ def make_excel(results):
         pd.DataFrame(summary_rows).to_excel(writer, index=False, sheet_name="법인요약")
         pd.DataFrame(bank_rows).to_excel(writer, index=False, sheet_name="거래은행")
         pd.DataFrame(evidence_rows).to_excel(writer, index=False, sheet_name="근거문구")
+        pd.DataFrame(pension_rows).to_excel(writer, index=False, sheet_name="퇴직연금요약")
+        pd.DataFrame(pension_evidence_rows, columns=["법인명","항목","근거원문"]).to_excel(writer, index=False, sheet_name="연금근거")
 
         for ws in writer.book.worksheets:
             ws.freeze_panes = "A2"
@@ -1360,15 +1456,15 @@ try:
     with st.spinner("DART 법인 목록을 불러오는 중입니다..."):
         corp_df = load_corp_codes(api_key)
 except Exception as e:
-    st.error(f"DART 연결 실패: {type(e).__name__}: {safe_error_text(e)}")
-    st.info("AWS 서울 리전에서는 국문 OpenDART를 우선 사용하고, 연결 오류 시 공식 영문 OpenDART로 자동 재시도합니다. API 키는 오류 화면에 노출되지 않도록 마스킹됩니다.")
+    st.error(f"DART 연결 실패: {type(e).__name__}: {e}")
+    st.info("v2.8은 국문 OpenDART 연결이 타임아웃되면 금융감독원 공식 영문 OpenDART API로 자동 우회합니다. 두 공식 도메인 모두 연결되지 않으면 Streamlit Community Cloud의 해외 네트워크 경로 문제일 가능성이 높습니다.")
     st.stop()
 
 try:
     init_local_db()
     sync_corp_master(corp_df)
 except Exception as e:
-    st.error(f"로컬 주소 DB 초기화 실패: {safe_error_text(e)}")
+    st.error(f"로컬 주소 DB 초기화 실패: {e}")
     st.stop()
 
 
@@ -1414,13 +1510,13 @@ with name_tab:
                 if info.get("adres"):
                     st.write(f"**본점 주소:** {info['adres']}")
 
-            if st.button("최근 감사보고서 분석", type="primary", key="single_analyze"):
+            if st.button("거래은행 + 퇴직연금 통합 분석", type="primary", key="single_analyze"):
                 try:
                     with st.spinner("최근 감사보고서를 찾고 금융기관 관련 내용을 분석 중입니다..."):
                         result = analyze_company(api_key, selected)
                     st.session_state["single_result"] = result
                 except Exception as e:
-                    st.error(f"분석 중 오류: {safe_error_text(e)}")
+                    st.error(f"분석 중 오류: {e}")
 
     result = st.session_state.get("single_result")
     if result:
@@ -1451,6 +1547,9 @@ with name_tab:
         elif r:
             st.warning("감사보고서 원문에서 등록된 은행명을 찾지 못했습니다.")
 
+        if r:
+            render_pension_analysis(result.get("pension") or analyze_pension_text(""))
+
         generic = result.get("generic", [])
         if generic:
             with st.expander("은행명이 특정되지 않은 금융기관 관련 문구"):
@@ -1469,8 +1568,8 @@ with name_tab:
 with region_tab:
     st.subheader("본점 소재지 / 사업장 소재지로 검색")
     st.caption(
-        "DART 주소 DB 또는 외부 기업목록(CSV/Excel)을 이용해 회사를 찾은 뒤, "
-        "DART 법인과 매칭하여 이전 버전과 동일하게 거래은행·차입금·담보·예금·보증/약정 정보를 분석합니다."
+        "DART 주소 DB 또는 외부 기업목록(CSV/Excel)에서 회사를 찾은 뒤, "
+        "DART 법인과 매칭하여 거래은행·차입금·담보·예금·퇴직연금 공시를 분석합니다."
     )
 
     total_cnt, addr_cnt, fail_cnt = address_db_stats()
@@ -1538,7 +1637,7 @@ with region_tab:
                     st.session_state["external_file_sig"] = file_sig
                     st.session_state["external_mapped_cols"] = mapped
                 except Exception as e:
-                    st.error(f"외부 기업목록 읽기 실패: {safe_error_text(e)}")
+                    st.error(f"외부 기업목록 읽기 실패: {e}")
             if "external_company_df" in st.session_state:
                 st.success(f"외부 기업목록 {len(st.session_state['external_company_df']):,}개 불러옴")
                 with st.expander("인식된 열 확인"):
@@ -1675,8 +1774,8 @@ with region_tab:
                 sel_label = st.selectbox("DART 법인 매칭", labels, key="region_dart_match_select")
                 selected_corp = candidate_rows[labels.index(sel_label)]
 
-                st.info("이 회사를 선택하면 이전 버전과 동일하게 감사보고서에서 거래은행과 금융거래 근거를 찾아줍니다.")
-                if st.button("🏦 거래은행 · 차입금 · 담보 분석", type="primary", key="region_analyze_btn"):
+                st.info("이 회사를 선택하면 감사보고서에서 거래은행·금융거래 근거와 퇴직연금 관련 공시를 함께 분석합니다.")
+                if st.button("🏦 거래은행 · 차입금 · 퇴직연금 분석", type="primary", key="region_analyze_btn"):
                     try:
                         with st.spinner("DART 감사보고서에서 거래은행·차입금·담보·예금·약정 정보를 분석 중입니다..."):
                             result = analyze_company(api_key, selected_corp)
@@ -1687,7 +1786,7 @@ with region_tab:
                         except Exception:
                             pass
                     except Exception as e:
-                        st.error(f"분석 중 오류: {safe_error_text(e)}")
+                        st.error(f"분석 중 오류: {e}")
 
         rr = st.session_state.get("region_analysis_result")
         if rr:
@@ -1710,6 +1809,9 @@ with region_tab:
                 st.warning("감사보고서 원문에서 등록된 은행명을 찾지 못했습니다.")
             elif rr.get("error"):
                 st.warning(rr["error"])
+
+            if r:
+                render_pension_analysis(rr.get("pension") or analyze_pension_text(""))
 
             generic = rr.get("generic", [])
             if generic:
@@ -1860,6 +1962,7 @@ with bulk_tab:
                 "접수일": r.get("접수일", ""),
                 "확인은행": ", ".join(b["은행"] for b in banks),
                 "확인은행수": len(banks),
+                "퇴직연금":(result.get("pension") or {}).get("판정", "자료 없음"),
                 "비고": result.get("error", ""),
             })
 
@@ -1922,7 +2025,7 @@ with db_tab:
             st.success(f"주소 DB {count:,}건을 복원했습니다.")
             st.rerun()
         except Exception as e:
-            st.error(f"복원 실패: {safe_error_text(e)}")
+            st.error(f"복원 실패: {e}")
 
 
 st.divider()
