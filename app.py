@@ -29,7 +29,7 @@ st.set_page_config(
 )
 
 st.title("🏢 법인 Finder")
-st.caption("법인명 + 본점/사업장 소재지 검색 · OpenDART 감사보고서/거래은행·차입금 분석 · 퇴직연금 유형 판별 대시보드 · v3.2")
+st.caption("법인명 + 본점/사업장 소재지 검색 · OpenDART 감사보고서/거래은행·차입금 분석 · 퇴직연금 유형 판별 대시보드 · v3.3")
 
 DART_BASE = "https://opendart.fss.or.kr/api"
 DART_ENG_BASE = "https://engopendart.fss.or.kr/engapi"
@@ -1427,6 +1427,7 @@ def analyze_company(api_key: str, corp_row: dict):
         "사업자등록번호": company.get("bizr_no", ""),
         "법인등록번호": company.get("jurir_no", ""),
         "주소": company.get("adres", ""),
+        "전화번호": company.get("phn_no", ""),
         "홈페이지": company.get("hm_url", ""),
     }
 
@@ -1631,6 +1632,7 @@ with name_tab:
                 cols[3].metric("업종코드", info.get("induty_code") or "-")
                 if info.get("adres"):
                     st.write(f"**본점 주소:** {info['adres']}")
+                st.write(f"**전화번호:** {info.get('phn_no') or '전화번호 미공개'}")
 
             if st.button("거래은행 + 퇴직연금 통합 분석", type="primary", key="single_analyze"):
                 try:
@@ -1656,6 +1658,7 @@ with name_tab:
 
         if c.get("주소"):
             st.write(f"**주소:** {c['주소']}")
+        st.write(f"**전화번호:** {c.get('전화번호') or '전화번호 미공개'}")
 
         if r:
             st.write(f"**최근 감사보고서:** {r['보고서명']} · 접수일 {r['접수일']}")
@@ -1878,6 +1881,7 @@ with region_tab:
             st.markdown("#### 선택 회사")
             st.write(f"**{picked.get('법인명','')}**")
             st.write(f"주소: {picked.get('주소') or '-'}")
+            st.write(f"전화번호: {picked.get('전화번호') or '전화번호 미공개'}")
             if picked.get("업종"):
                 st.write(f"업종/제품: {picked.get('업종')}")
 
@@ -1922,6 +1926,7 @@ with region_tab:
             cols[2].metric("법인번호", c.get("법인등록번호") or "-")
             cols[3].metric("확인은행", len(rr.get("banks", [])))
             st.write(f"**본점 주소:** {c.get('주소') or '-'}")
+            st.write(f"**전화번호:** {c.get('전화번호') or (picked.get('전화번호') if picked else '') or '전화번호 미공개'}")
             if r:
                 st.write(f"**최근 감사보고서:** {r['보고서명']} · {r['접수일']}")
                 st.link_button("DART 원문 열기", r["DART링크"], key="region_dart_link")
