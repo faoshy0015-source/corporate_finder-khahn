@@ -29,7 +29,7 @@ st.set_page_config(
 )
 
 st.title("🏢 법인 Finder")
-st.caption("법인명 + 본점/사업장 소재지 검색 · OpenDART 감사보고서/거래은행·차입금 분석 · 퇴직연금 분석 · v2.9")
+st.caption("법인명 + 본점/사업장 소재지 검색 · OpenDART 감사보고서/거래은행·차입금 분석 · 퇴직연금 대시보드 · v3.1")
 
 DART_BASE = "https://opendart.fss.or.kr/api"
 DART_ENG_BASE = "https://engopendart.fss.or.kr/engapi"
@@ -1162,32 +1162,91 @@ def analyze_pension_text(raw_text: str) -> dict:
 
 
 def render_pension_analysis(pension: dict):
-    st.markdown("### 🏦 퇴직연금·퇴직급여 공시 분석")
-    st.metric("퇴직연금 분석 결과", pension.get("판정", "공시 근거 미확인"))
-    st.caption(pension.get("안내", ""))
-    for label, key in [("DB형 관련 근거", "DB근거"),("DC형 관련 근거", "DC근거"),("기타 퇴직급여 근거", "일반근거")]:
-        rows=pension.get(key) or []
+    """공시 근거에 기반한 퇴직연금 영업 대시보드. 미검증 금액은 노출하지 않음."""
+    st.markdown("### 📊 퇴직연금 영업분석 대시보드")
+    st.caption("감사보고서 공시 기반 · 확정 정보와 추가 확인이 필요한 사항을 구분")
+
+    status = pension.get("판정") or "공시 근거 미확인"
+    db = bool(pension.get("DB근거"))
+    dc = bool(pension.get("DC근거"))
+    if db and dc:
+        pension_type = "DB·DC 관련 공시"
+    elif db:
+        pension_type = "DB형 관련 공시"
+    elif dc:
+        pension_type = "DC형 관련 공시"
+    elif pension.get("일반근거"):
+        pension_type = "유형 미확인"
+    else:
+        pension_type = "공시 근거 없음"
+    institutions = pension.get("연금기관후보") or []
+    amt = pension.get("금액관련근거") or {}
+    asset_rows = amt.get("사외적립자산") or []
+    obligation_rows = amt.get("확정급여채무") or []
+    institution_label = f"후보 {len(institutions)}개" if institutions else "미확인"
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("퇴직연금 제도", pension_type)
+    with c2:
+        st.metric("사외적립자산", "금액 미검증")
+        st.caption(f"관련 원문 {len(asset_rows)}건" if asset_rows else "금액 관련 원문 없음")
+    with c3:
+        st.metric("확정급여채무", "금액 미검증")
+        st.caption(f"관련 원문 {len(obligation_rows)}건" if obligation_rows else "금액 관련 원문 없음")
+    with c4:
+        st.metric("퇴직연금 금융기관", institution_label)
+        st.caption("기관명·역할 원문 확인 필요")
+
+    with st.container(border=True):
+        st.markdown("#### 🎯 영업 검토 요약")
+        if db or dc:
+            st.success(f"**{status}** — 퇴직연금 상담 대상 여부를 검토할 만한 공시 단서가 있습니다.")
+        elif pension.get("일반근거"):
+            st.info("퇴직급여 관련 공시는 있으나 DB/DC 제도 운영 여부는 확인되지 않았습니다.")
+        else:
+            st.warning("분석 대상 원문에서 퇴직연금 관련 근거를 찾지 못했습니다. 미운영을 뜻하지는 않습니다.")
+        st.markdown("**상담 시 확인할 4가지 사항**")
+        st.markdown("① 실제 DB/DC 가입 여부 및 가입 인원  ·  ② 현재 퇴직연금사업자  ·  ③ 적립금·전년도 납입액  ·  ④ 연말 추가납입·사업자 변경 계획")
+        st.caption("참고: 사외적립자산/확정급여채무는 법정 최소적립금 충족률을 직접 의미하지 않으며, 공시상 기관명만으로 퇴직연금사업자라고 단정할 수 없습니다.")
+
+    left, right = st.columns([1, 1])
+    with left:
+        st.markdown("#### 🔍 공시 근거 현황")
+        overview = pd.DataFrame([
+            {"구분": "DB형", "근거건수": len(pension.get("DB근거") or []), "상태": "관련 문구 있음" if db else "미확인"},
+            {"구분": "DC형", "근거건수": len(pension.get("DC근거") or []), "상태": "관련 문구 있음" if dc else "미확인"},
+            {"구분": "사외적립자산", "근거건수": len(asset_rows), "상태": "금액 검증 필요" if asset_rows else "미확인"},
+            {"구분": "확정급여채무", "근거건수": len(obligation_rows), "상태": "금액 검증 필요" if obligation_rows else "미확인"},
+        ])
+        st.dataframe(overview, use_container_width=True, hide_index=True)
+    with right:
+        st.markdown("#### 🏦 금융기관 연결 근거")
+        if institutions:
+            st.dataframe(pd.DataFrame(institutions), use_container_width=True, hide_index=True)
+        else:
+            st.info("연금 문맥에서 특정 금융기관을 직접 확인하지 못했습니다.")
+        st.caption("기존 거래은행 목록은 연금 운용기관 목록과 별개입니다.")
+
+    st.markdown("#### 📑 감사보고서 상세 근거")
+    for label, key in [("DB형 관련 근거", "DB근거"), ("DC형 관련 근거", "DC근거"), ("기타 퇴직급여 근거", "일반근거")]:
+        rows = pension.get(key) or []
         if rows:
-            with st.expander(f"{label} ({len(rows)}건)", expanded=(key=="DB근거")):
-                for row in rows:
+            with st.expander(f"{label} ({len(rows)}건)", expanded=False):
+                for i, row in enumerate(rows, 1):
+                    st.markdown(f"**근거 {i}**")
                     st.info(row)
-    with st.expander("사외적립자산·급여채무·DC부담금 관련 원문 (금액 검증용)"):
-        found=False
-        for label, rows in (pension.get("금액관련근거") or {}).items():
+    with st.expander("사외적립자산·급여채무·DC 부담금 원문 (단위/기준일 검증)", expanded=False):
+        found = False
+        for label, rows in amt.items():
             if rows:
-                found=True
+                found = True
                 st.markdown(f"**{label}**")
                 for row in rows:
-                    st.write("• "+row)
+                    st.info(row)
         if not found:
-            st.info("관련 금액 근거를 발견하지 못했습니다.")
-    institutions=pension.get("연금기관후보") or []
-    if institutions:
-        st.markdown("#### 연금 관련 금융기관명 후보 · 원문 확인 필요")
-        st.dataframe(pd.DataFrame(institutions),use_container_width=True,hide_index=True)
-    else:
-        st.caption("퇴직연금 운용 금융기관은 공개 원문에서 직접 연결되는 근거를 확인하지 못했습니다.")
-    st.caption("영업 활용: 담당자에게 DB/DC 제도, 사업자, 적립 규모, 추가 납입 계획을 확인한 뒤 유치 가능성을 판단하세요.")
+            st.info("관련 원문을 발견하지 못했습니다.")
+    st.caption(pension.get("안내", ""))
 
 
 # =========================================================
