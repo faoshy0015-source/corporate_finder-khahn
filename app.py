@@ -29,7 +29,7 @@ st.set_page_config(
 )
 
 st.title("🏢 법인 Finder")
-st.caption("법인명 + 본점/사업장 소재지 검색 · OpenDART 감사보고서/거래은행·차입금 분석 · 퇴직연금 대시보드 · v3.1")
+st.caption("법인명 + 본점/사업장 소재지 검색 · OpenDART 감사보고서/거래은행·차입금 분석 · 퇴직연금 유형 판별 대시보드 · v3.2")
 
 DART_BASE = "https://opendart.fss.or.kr/api"
 DART_ENG_BASE = "https://engopendart.fss.or.kr/engapi"
@@ -1118,6 +1118,63 @@ PENSION_AMOUNT_PATTERNS = {
 PENSION_EXTRA_TERMS = [r"퇴직연금사업자", r"퇴직연금운용기관", r"퇴직연금운용자산", r"연금자산", r"연금신탁"]
 
 
+
+# 제도 '운영'의 직접 근거와 회계정책상 일반 설명을 구별한다.
+# 추정 분류를 운영 확정으로 오인하지 않도록 보수적으로 설정한다.
+PENSION_NEGATIVE_RE = re.compile(
+    r"(?:퇴직연금(?:제도)?|확정급여제도|확정기여제도).{0,28}(?:운영하지\s*않|가입하지\s*않|도입하지\s*않|미운영|미가입|미도입|없(?:습니|다))|"
+    r"(?:퇴직연금(?:제도)?|확정급여제도|확정기여제도)\s*(?:미운영|미가입|미도입)", re.I)
+PENSION_DB_DIRECT_RE = re.compile(
+    r"(?:당사|연결회사|회사는|회사의|회사는\s*현재|임직원|종업원).{0,90}"
+    r"(?:확정급여(?:형|제도)|DB형).{0,80}(?:운영|가입|도입|적용|유지|설정)|"
+    r"(?:확정급여(?:형|제도)|DB형).{0,90}(?:운영하고|운용하고|가입하고|도입하였|적용하고|유지하고)|"
+    r"(?:당기말|보고기간말|기말).{0,75}(?:사외적립자산|확정급여채무).{0,75}\d[\d,]*|"
+    r"(?:사외적립자산|확정급여채무).{0,50}\d[\d,]*(?:\s*(?:천원|백만원|억원|원))", re.I)
+PENSION_DC_DIRECT_RE = re.compile(
+    r"(?:당사|연결회사|회사는|임직원|종업원).{0,90}"
+    r"(?:확정기여(?:형|제도)|DC형).{0,80}(?:운영|가입|도입|적용|유지)|"
+    r"(?:확정기여(?:형|제도)|DC형).{0,90}(?:운영하고|운용하고|가입하고|도입하였|적용하고|유지하고)|"
+    r"(?:확정기여(?:형|제도)|DC형).{0,90}(?:납입|부담금|기여금|비용).{0,50}\d[\d,]*|"
+    r"(?:확정기여(?:형|제도)|DC형).{0,50}\d[\d,]*(?:\s*(?:천원|백만원|억원|원))", re.I)
+PENSION_POLICY_RE = re.compile(r"회계정책|회계처리|측정|인식|평가|추정|기업회계기준|공정가치|회계기준|부채로\s*인식|비용으로\s*인식", re.I)
+
+
+def classify_pension_operations(raw_text: str) -> dict:
+    """운영 증거를 우선, 불충분하면 미확인. 회사의 실제 연금계약을 보증하지 않음."""
+    blocks = [re.sub(r"\s+", " ", line).strip() for line in re.split(r"\n+", raw_text or "") if line.strip()]
+    direct = {"DB": [], "DC": [], "미운용": []}
+    clues = {"DB": [], "DC": []}
+    for line in blocks:
+        snippet = line[:650]
+        # 원문에 숫자나 '운영'이 등장하더라도 회계정책을 설명하는 가정문이면 직접 증거 제외
+        policy_or_conditional = bool(PENSION_POLICY_RE.search(line) and re.search(r"경우|하여|으로\s*표시|있습니다|가정|회계정책",line,re.I))
+        conditional = bool(re.search(r"(?:할\s*경우|하는\s*경우|경우에는|경우\s*해당|가정하여)",line,re.I))
+        neg=bool(PENSION_NEGATIVE_RE.search(line))
+        if neg and len(direct["미운용"])<4:
+            direct["미운용"].append(snippet)
+        for key, keyword, pattern in [("DB", r"확정급여|사외적립자산|DB형|defined\s+benefit", PENSION_DB_DIRECT_RE),
+                                      ("DC", r"확정기여|DC형|defined\s+contribution", PENSION_DC_DIRECT_RE)]:
+            if re.search(keyword,line,re.I) and len(clues[key]) < 5:
+                clues[key].append(snippet)
+            if not neg and not policy_or_conditional and not conditional and pattern.search(line) and len(direct[key])<5:
+                direct[key].append(snippet)
+    db,dc = bool(direct["DB"]),bool(direct["DC"])
+    non=bool(direct["미운용"])
+    if non and (db or dc):
+        label="확인 불가"; confidence="상충 근거"
+    elif db and dc:
+        label="DB+DC 혼합"; confidence="직접 근거 확인"
+    elif db:
+        label="DB형 운영"; confidence="직접 근거 확인"
+    elif dc:
+        label="DC형 운영"; confidence="직접 근거 확인"
+    elif non:
+        label="미운용 확인"; confidence="명시적 부정 공시"
+    else:
+        label="확인 불가"; confidence="운영 직접 근거 부족"
+    return {"운영분류":label,"판별신뢰":confidence,"운영근거":direct,"관련단서":clues}
+
+
 def analyze_pension_text(raw_text: str) -> dict:
     """원문 공시 내 근거 탐색. 표 단위·금액 열 연계가 확실하지 않으면 임의 금액 추출 금지."""
     blocks = [re.sub(r"\s+", " ", x).strip() for x in re.split(r"\n+", raw_text or "") if x.strip()]
@@ -1155,7 +1212,8 @@ def analyze_pension_text(raw_text: str) -> dict:
         status="퇴직급여 관련 공시 확인 · 유형 불명"
     else:
         status="공시 근거 미확인"
-    return {"판정": status, "DB근거": signals["DB형"], "DC근거": signals["DC형"],
+    operations = classify_pension_operations(raw_text)
+    return {**operations, "판정": status, "DB근거": signals["DB형"], "DC근거": signals["DC형"],
             "일반근거":signals["퇴직연금"], "금액관련근거":amounts,
             "연금기관후보":institution_evidence[:12],
             "안내":"DART 공개문서 기반 단서이며 실제 제도 가입·계좌별 적립금·수탁/운용기관을 확정하지 않습니다. 표의 단위·기준일·열 구성을 원문에서 확인하세요."}
@@ -1167,18 +1225,10 @@ def render_pension_analysis(pension: dict):
     st.caption("감사보고서 공시 기반 · 확정 정보와 추가 확인이 필요한 사항을 구분")
 
     status = pension.get("판정") or "공시 근거 미확인"
+    pension_type = pension.get("운영분류", "확인 불가")
+    confidence = pension.get("판별신뢰", "운영 직접 근거 부족")
     db = bool(pension.get("DB근거"))
     dc = bool(pension.get("DC근거"))
-    if db and dc:
-        pension_type = "DB·DC 관련 공시"
-    elif db:
-        pension_type = "DB형 관련 공시"
-    elif dc:
-        pension_type = "DC형 관련 공시"
-    elif pension.get("일반근거"):
-        pension_type = "유형 미확인"
-    else:
-        pension_type = "공시 근거 없음"
     institutions = pension.get("연금기관후보") or []
     amt = pension.get("금액관련근거") or {}
     asset_rows = amt.get("사외적립자산") or []
@@ -1187,7 +1237,8 @@ def render_pension_analysis(pension: dict):
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.metric("퇴직연금 제도", pension_type)
+        st.metric("퇴직연금 운영 분류", pension_type)
+        st.caption(confidence)
     with c2:
         st.metric("사외적립자산", "금액 미검증")
         st.caption(f"관련 원문 {len(asset_rows)}건" if asset_rows else "금액 관련 원문 없음")
@@ -1200,12 +1251,21 @@ def render_pension_analysis(pension: dict):
 
     with st.container(border=True):
         st.markdown("#### 🎯 영업 검토 요약")
-        if db or dc:
-            st.success(f"**{status}** — 퇴직연금 상담 대상 여부를 검토할 만한 공시 단서가 있습니다.")
-        elif pension.get("일반근거"):
-            st.info("퇴직급여 관련 공시는 있으나 DB/DC 제도 운영 여부는 확인되지 않았습니다.")
+        if pension_type in ("DB형 운영", "DC형 운영", "DB+DC 혼합"):
+            st.success(f"**{pension_type}** — 해당 유형의 운영을 시사하는 직접 공시 근거를 발견했습니다. 계약 정보는 별도 확인하세요.")
+        elif pension_type == "미운용 확인":
+            st.info("퇴직연금 미운용에 관한 명시적인 문구가 있습니다. 기준일과 회사 전체 적용 여부를 원문에서 확인하세요.")
         else:
-            st.warning("분석 대상 원문에서 퇴직연금 관련 근거를 찾지 못했습니다. 미운영을 뜻하지는 않습니다.")
+            st.warning("운영 유형 확인 불가: 관련 문구만으로 운영 또는 미운영을 단정할 수 없습니다.")
+        st.caption(f"기존 키워드 분석: {status}")
+        op = pension.get("운영근거") or {}
+        with st.expander("운영형태 판별 근거 (DB·DC·미운용)", expanded=False):
+            for k in ("DB", "DC", "미운용"):
+                st.markdown(f"**{k} 직접 근거**")
+                for line in op.get(k, []):
+                    st.info(line)
+                if not op.get(k):
+                    st.caption("직접 근거 없음")
         st.markdown("**상담 시 확인할 4가지 사항**")
         st.markdown("① 실제 DB/DC 가입 여부 및 가입 인원  ·  ② 현재 퇴직연금사업자  ·  ③ 적립금·전년도 납입액  ·  ④ 연말 추가납입·사업자 변경 계획")
         st.caption("참고: 사외적립자산/확정급여채무는 법정 최소적립금 충족률을 직접 의미하지 않으며, 공시상 기관명만으로 퇴직연금사업자라고 단정할 수 없습니다.")
@@ -1425,9 +1485,12 @@ def make_excel(results):
         })
 
         pen=result.get("pension") or {}
-        pension_rows.append({"법인명":c.get("법인명", ""), "퇴직연금판정":pen.get("판정", "분석자료 없음"),
+        pension_rows.append({"법인명":c.get("법인명", ""), "운영형태":pen.get("운영분류", "확인 불가"), "판별신뢰":pen.get("판별신뢰", ""), "퇴직연금판정":pen.get("판정", "분석자료 없음"),
                              "연금기관명후보":", ".join(x.get("금융기관", "") for x in pen.get("연금기관후보",[])),
                              "DART링크":report.get("DART링크", "")})
+        for category, evidences in (pen.get("운영근거") or {}).items():
+            for evidence in evidences:
+                pension_evidence_rows.append({"법인명":c.get("법인명", ""),"항목":"운영 직접근거 - "+category,"근거원문":evidence})
         for category, key in [("DB형", "DB근거"),("DC형", "DC근거"),("퇴직급여", "일반근거")]:
             for evidence in pen.get(key, []):
                 pension_evidence_rows.append({"법인명":c.get("법인명", ""),"항목":category,"근거원문":evidence})
@@ -2021,7 +2084,7 @@ with bulk_tab:
                 "접수일": r.get("접수일", ""),
                 "확인은행": ", ".join(b["은행"] for b in banks),
                 "확인은행수": len(banks),
-                "퇴직연금":(result.get("pension") or {}).get("판정", "자료 없음"),
+                "퇴직연금":(result.get("pension") or {}).get("운영분류", "확인 불가"),
                 "비고": result.get("error", ""),
             })
 
