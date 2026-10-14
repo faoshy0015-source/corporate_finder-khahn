@@ -1,6 +1,8 @@
 
 import io
 import os
+import json
+import tempfile
 import html
 import re
 import ssl
@@ -29,11 +31,14 @@ st.set_page_config(
 )
 
 st.title("🏢 법인 Finder")
-st.caption("법인명 + 본점/사업장 소재지 검색 · OpenDART 감사보고서/거래은행·차입금 분석 · 퇴직연금 유형 판별 대시보드 · v3.3")
+st.caption("법인명 + 본점/사업장 소재지 검색 · OpenDART 감사보고서/거래은행·차입금 분석 · 퇴직연금 유형 판별 대시보드 · v3.4 · 로컬 DB 우선")
 
 DART_BASE = "https://opendart.fss.or.kr/api"
 DART_ENG_BASE = "https://engopendart.fss.or.kr/engapi"
-DB_PATH = Path(os.getenv("CORP_FINDER_DB", "corp_finder_cache.sqlite3"))
+# 실행 위치와 관계없이 app.py와 같은 폴더에 DB를 저장합니다.
+# 별도 경로가 필요하면 CORP_FINDER_DB 환경변수로 지정할 수 있습니다.
+_db_override = os.getenv("CORP_FINDER_DB", "").strip()
+DB_PATH = Path(_db_override).expanduser().resolve() if _db_override else (Path(__file__).resolve().parent / "corp_finder_cache.sqlite3")
 
 
 # =========================================================
@@ -443,6 +448,7 @@ EXTERNAL_COL_CANDIDATES = {
 
 
 def get_db_connection():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
@@ -482,8 +488,132 @@ def init_local_db():
             CREATE INDEX IF NOT EXISTS idx_profile_adres ON company_profile(adres);
             CREATE INDEX IF NOT EXISTS idx_profile_name ON company_profile(corp_name);
             CREATE INDEX IF NOT EXISTS idx_master_norm_name ON corp_master(norm_name);
+
+            CREATE TABLE IF NOT EXISTS db_meta (
+                meta_key TEXT PRIMARY KEY,
+                meta_value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS company_analysis (
+                corp_code TEXT PRIMARY KEY,
+                result_json TEXT NOT NULL,
+                analyzed_at TEXT NOT NULL
+            );
             """
         )
+
+
+def set_db_meta(key: str, value: str):
+    with get_db_connection() as conn:
+        conn.execute(
+            "INSERT INTO db_meta(meta_key, meta_value) VALUES (?, ?) "
+            "ON CONFLICT(meta_key) DO UPDATE SET meta_value=excluded.meta_value",
+            (key, value),
+        )
+
+
+def get_db_meta(key: str, default: str = "") -> str:
+    with get_db_connection() as conn:
+        row = conn.execute("SELECT meta_value FROM db_meta WHERE meta_key=?", (key,)).fetchone()
+    return str(row[0]) if row else default
+
+
+def load_saved_corp_master() -> pd.DataFrame:
+    """DART에 접속하지 않고 마지막으로 저장한 법인 고유번호 목록을 읽습니다."""
+    with get_db_connection() as conn:
+        df = pd.read_sql_query(
+            "SELECT corp_code, corp_name, stock_code, modify_date, norm_name "
+            "FROM corp_master ORDER BY corp_name", conn,
+        )
+    if df.empty:
+        return pd.DataFrame(columns=["corp_code", "corp_name", "stock_code", "modify_date", "norm_name"])
+    for col in ("corp_code", "corp_name", "stock_code", "modify_date", "norm_name"):
+        df[col] = df[col].fillna("").astype(str)
+    missing = df["norm_name"].eq("")
+    if missing.any():
+        df.loc[missing, "norm_name"] = df.loc[missing, "corp_name"].map(normalize_company_name)
+    return df
+
+
+def get_saved_company_profile(corp_code: str) -> dict | None:
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM company_profile WHERE corp_code=?", (str(corp_code),)
+        ).fetchone()
+    if row is None or (row["fetch_error"] and not row["adres"]):
+        return None
+    return dict(row)
+
+
+def save_company_analysis(result: dict):
+    code = str((result.get("company") or {}).get("DART고유번호", "")).strip()
+    if not code:
+        return
+    now = datetime.now().isoformat(timespec="seconds")
+    payload = json.dumps(result, ensure_ascii=False, default=str)
+    with get_db_connection() as conn:
+        conn.execute(
+            "INSERT INTO company_analysis(corp_code, result_json, analyzed_at) VALUES(?,?,?) "
+            "ON CONFLICT(corp_code) DO UPDATE SET "
+            "result_json=excluded.result_json, analyzed_at=excluded.analyzed_at",
+            (code, payload, now),
+        )
+
+
+def get_saved_company_analysis(corp_code: str):
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT result_json, analyzed_at FROM company_analysis WHERE corp_code=?",
+            (str(corp_code),),
+        ).fetchone()
+    if not row:
+        return None, ""
+    return json.loads(row["result_json"]), row["analyzed_at"]
+
+
+def export_full_db_bytes() -> bytes:
+    """백업 시점의 전체 SQLite DB 스냅샷(법인/주소/분석 결과)을 생성합니다."""
+    with tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False) as f:
+        tmp = Path(f.name)
+    src = dst = None
+    try:
+        src = get_db_connection()
+        dst = sqlite3.connect(tmp)
+        src.backup(dst)
+        dst.close(); dst = None
+        src.close(); src = None
+        return tmp.read_bytes()
+    finally:
+        if src is not None: src.close()
+        if dst is not None: dst.close()
+        tmp.unlink(missing_ok=True)
+
+
+def restore_full_db_bytes(raw: bytes):
+    """스키마/무결성 검사 후 백업 DB를 복원합니다."""
+    if not raw or not raw.startswith(b"SQLite format 3\x00"):
+        raise ValueError("올바른 SQLite DB 파일이 아닙니다.")
+    with tempfile.NamedTemporaryFile(suffix=".sqlite3", delete=False) as f:
+        tmp = Path(f.name)
+        f.write(raw)
+    src = dst = None
+    try:
+        src = sqlite3.connect(tmp)
+        integrity = src.execute("PRAGMA integrity_check").fetchone()[0]
+        if integrity != "ok":
+            raise ValueError(f"DB 무결성 검증 실패: {integrity}")
+        tbls = {r[0] for r in src.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if not {"corp_master", "company_profile"}.issubset(tbls):
+            raise ValueError("Corporate Finder의 법인/주소 DB가 아닙니다.")
+        dst = get_db_connection()
+        src.backup(dst)
+        dst.close(); dst = None
+        src.close(); src = None
+        init_local_db()  # 이전 버전 백업도 최신 테이블로 자동 마이그레이션
+    finally:
+        if src is not None: src.close()
+        if dst is not None: dst.close()
+        tmp.unlink(missing_ok=True)
 
 
 def sync_corp_master(corp_df: pd.DataFrame):
@@ -1412,7 +1542,7 @@ def company_label(row):
     return f'{row["corp_name"]} / DART {row["corp_code"]}{stock_txt}'
 
 
-def analyze_company(api_key: str, corp_row: dict):
+def _analyze_company_online(api_key: str, corp_row: dict):
     corp_code = corp_row["corp_code"]
     corp_name = corp_row["corp_name"]
 
@@ -1461,6 +1591,26 @@ def analyze_company(api_key: str, corp_row: dict):
         "pension": pension,
         "error": "",
     }
+
+
+def analyze_company(api_key: str, corp_row: dict):
+    """온라인에서는 신규 분석 결과 저장, 오프라인에서는 마지막 분석 결과 사용."""
+    code = str(corp_row.get("corp_code", ""))
+    cached, analyzed_at = get_saved_company_analysis(code)
+    if not dart_enabled:
+        if cached is None:
+            raise RuntimeError("저장된 감사보고서 분석 결과가 없습니다. 인터넷 PC에서 해당 법인을 한 번 분석한 뒤 DB를 옮겨 주세요.")
+        st.info(f"오프라인: {analyzed_at}에 저장된 거래은행·퇴직연금 분석 결과를 표시합니다. 최신 공시는 반영되지 않습니다.")
+        return cached
+    try:
+        result = _analyze_company_online(api_key, corp_row)
+        save_company_analysis(result)
+        return result
+    except Exception as exc:
+        if cached is not None:
+            st.warning(f"DART 신규 조회 실패로 {analyzed_at}에 저장된 분석 결과를 표시합니다. 원인: {type(exc).__name__}")
+            return cached
+        raise
 
 
 def make_excel(results):
@@ -1560,35 +1710,63 @@ if APP_PASSWORD:
 
 
 # =========================================================
-# API 키
+# 로컬 DB 먼저 실행: 온라인 업데이트는 명시적으로 요청할 때만
 # =========================================================
 api_key = str(get_secret("DART_API_KEY", "")).strip()
-
-if not api_key:
-    st.error("DART API 키가 설정되지 않았습니다. Streamlit Cloud의 App settings → Secrets에 `DART_API_KEY = \"발급받은키\"`를 등록한 뒤 Reboot app 해주세요.")
-    st.stop()
-
-if len(api_key) != 40:
-    st.warning(f"DART API 키 길이가 일반적인 40자리와 다릅니다. 현재 {len(api_key)}자리입니다. Secrets 값에 따옴표 외의 공백/문자가 들어갔는지 확인해 주세요.")
-
-
-# =========================================================
-# 법인 코드 불러오기
-# =========================================================
-try:
-    with st.spinner("DART 법인 목록을 불러오는 중입니다..."):
-        corp_df = load_corp_codes(api_key)
-except Exception as e:
-    st.error(f"DART 연결 실패: {type(e).__name__}: {e}")
-    st.info("v2.8은 국문 OpenDART 연결이 타임아웃되면 금융감독원 공식 영문 OpenDART API로 자동 우회합니다. 두 공식 도메인 모두 연결되지 않으면 Streamlit Community Cloud의 해외 네트워크 경로 문제일 가능성이 높습니다.")
-    st.stop()
+offline_mode = st.checkbox(
+    "오프라인 모드 (저장된 DB만 사용 / DART 접속 안 함)",
+    value=not bool(api_key),
+    key="corp_finder_offline_mode",
+)
+dart_enabled = bool(api_key) and not offline_mode
 
 try:
     init_local_db()
-    sync_corp_master(corp_df)
+    corp_df = load_saved_corp_master()
 except Exception as e:
-    st.error(f"로컬 주소 DB 초기화 실패: {e}")
+    st.error(f"로컬 DB 초기화/불러오기 실패: {e}")
     st.stop()
+
+# DB가 비어 있을 때에만 최초 DART 법인목록을 자동 저장합니다.
+if corp_df.empty and dart_enabled:
+    try:
+        with st.spinner("최초 1회 DART 법인목록을 수집하고 로컬 DB에 저장 중입니다..."):
+            fresh_df = load_corp_codes(api_key)
+            sync_corp_master(fresh_df)
+            set_db_meta("corp_master_updated_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            corp_df = load_saved_corp_master()
+    except Exception as e:
+        st.error(f"최초 DART 법인목록 구축에 실패했습니다: {type(e).__name__}: {e}")
+
+if corp_df.empty:
+    st.warning("아직 저장된 법인 DB가 없습니다. 인터넷이 되는 PC에서 최초 DB를 구축하거나 전체 SQLite 백업파일을 복원해 주세요.")
+    startup_restore = st.file_uploader("전체 SQLite DB 백업 복원", type=["sqlite3", "db"], key="startup_full_restore")
+    if startup_restore is not None and st.button("저장 DB 복원", type="primary", key="startup_full_restore_btn"):
+        try:
+            restore_full_db_bytes(startup_restore.getvalue())
+            st.success("DB를 복원했습니다.")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"복원 실패: {exc}")
+    st.stop()
+
+last_db_sync = get_db_meta("corp_master_updated_at", "기존 저장본 (갱신일 기록 없음)")
+mode_label = "오프라인" if not dart_enabled else "로컬 DB 우선"
+st.caption(f"💾 {mode_label} · 저장 법인 {len(corp_df):,}개 · 마지막 법인목록 갱신: {last_db_sync} · DB 위치: {DB_PATH.name}")
+if st.button("🔄 DART 법인목록 최신 업데이트", disabled=not dart_enabled, key="refresh_master_db"):
+    try:
+        with st.spinner("DART에서 최신 법인목록을 수집 중입니다. 저장된 DB는 정상 수집 후 갱신합니다..."):
+            load_corp_codes.clear()  # 이전 Streamlit 캐시가 아닌 새 DART 목록 요청
+            fresh_df = load_corp_codes(api_key)
+            sync_corp_master(fresh_df)
+            set_db_meta("corp_master_updated_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        st.success("최신 법인목록을 로컬 DB에 저장했습니다.")
+        st.rerun()
+    except Exception as exc:
+        st.error(f"업데이트에 실패했습니다. 기존 저장 DB를 유지합니다: {exc}")
+
+if not dart_enabled:
+    st.info("저장된 법인·주소·전화번호를 검색할 수 있습니다. 거래은행·퇴직연금은 이전에 분석·저장한 법인에 한해 조회할 수 있습니다.")
 
 
 # =========================================================
@@ -1617,12 +1795,13 @@ with name_tab:
             selected_label = st.selectbox("회사 선택", labels, key="name_company_select")
             selected = options[labels.index(selected_label)]
 
-            info = None
-            try:
-                info = get_company_info(api_key, selected["corp_code"])
-                save_company_profile(selected, info, "")
-            except Exception:
-                pass
+            info = get_saved_company_profile(selected["corp_code"])
+            if info is None and dart_enabled:
+                try:
+                    info = get_company_info(api_key, selected["corp_code"])
+                    save_company_profile(selected, info, "")
+                except Exception:
+                    pass
 
             if info:
                 cols = st.columns(4)
@@ -1712,7 +1891,7 @@ with region_tab:
         quick_batch = qa.selectbox(
             "빠른 주소수집", [50, 100, 200, 300], index=1, key="region_quick_batch"
         )
-        if qb.button("🚀 DART 주소 DB 지금 구축", type="primary", key="region_quick_build"):
+        if qb.button("🚀 DART 주소 DB 지금 구축", type="primary", key="region_quick_build", disabled=not dart_enabled):
             ok, fail = build_address_cache(api_key, quick_batch, True, False)
             if ok or fail:
                 st.success(f"주소 DB 구축: 성공 {ok:,}개 / 오류 {fail:,}개")
@@ -1906,11 +2085,12 @@ with region_tab:
                         with st.spinner("DART 감사보고서에서 거래은행·차입금·담보·예금·약정 정보를 분석 중입니다..."):
                             result = analyze_company(api_key, selected_corp)
                         st.session_state["region_analysis_result"] = result
-                        try:
-                            profile = get_company_info(api_key, selected_corp["corp_code"])
-                            save_company_profile(selected_corp, profile, "")
-                        except Exception:
-                            pass
+                        if dart_enabled:
+                            try:
+                                profile = get_company_info(api_key, selected_corp["corp_code"])
+                                save_company_profile(selected_corp, profile, "")
+                            except Exception:
+                                pass
                     except Exception as e:
                         st.error(f"분석 중 오류: {e}")
 
@@ -2044,11 +2224,12 @@ with bulk_tab:
                     try:
                         result = analyze_company(api_key, selected)
                         results.append(result)
-                        try:
-                            profile = get_company_info(api_key, selected["corp_code"])
-                            save_company_profile(selected, profile, "")
-                        except Exception:
-                            pass
+                        if dart_enabled:
+                            try:
+                                profile = get_company_info(api_key, selected["corp_code"])
+                                save_company_profile(selected, profile, "")
+                            except Exception:
+                                pass
                     except Exception as e:
                         results.append({
                             "company": {
@@ -2106,6 +2287,24 @@ with bulk_tab:
 
 with db_tab:
     st.subheader("DART 본점주소 DB 구축 / 백업")
+    st.markdown("#### 💾 전체 DB 백업 / 복원 (사내망 PC 이동용)")
+    st.caption("법인목록·주소·전화번호·기존 거래은행/퇴직연금 분석 결과를 한 파일로 보관합니다. DB 복원 시 현재 데이터를 대체합니다.")
+    st.download_button(
+        "📥 전체 DB(SQLite) 백업 다운로드",
+        data=export_full_db_bytes(),
+        file_name="corp_finder_cache.sqlite3",
+        mime="application/x-sqlite3",
+        key="full_db_export",
+    )
+    full_restore_file = st.file_uploader("전체 DB 백업파일 복원", type=["sqlite3", "db"], key="full_db_restore_file")
+    if full_restore_file is not None and st.button("전체 DB 복원 실행", key="full_db_restore_btn"):
+        try:
+            restore_full_db_bytes(full_restore_file.getvalue())
+            st.success("전체 DB 복원 완료. 법인 목록을 다시 불러옵니다.")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"전체 DB 복원 실패: {exc}")
+    st.divider()
     total_cnt, addr_cnt, fail_cnt = address_db_stats()
     cols = st.columns(4)
     cols[0].metric("DART 법인", f"{total_cnt:,}")
@@ -2126,7 +2325,7 @@ with db_tab:
     listed_first = b2.checkbox("상장사 우선", value=True, key="db_listed_first")
     retry_errors = b3.checkbox("오류 회사 재시도 포함", value=False, key="db_retry_errors")
 
-    if st.button("주소 DB 이어서 구축", type="primary", key="db_build_btn"):
+    if st.button("주소 DB 이어서 구축", type="primary", key="db_build_btn", disabled=not dart_enabled):
         ok, fail = build_address_cache(api_key, batch_size, listed_first, retry_errors)
         if ok == 0 and fail == 0:
             st.success("추가로 수집할 회사가 없습니다.")
@@ -2135,7 +2334,7 @@ with db_tab:
             st.rerun()
 
     st.markdown("#### 주소 DB 백업 / 복원")
-    st.caption("Streamlit Cloud 재배포 시 로컬 파일이 초기화될 수 있으므로, 주소 DB는 가끔 엑셀로 내려받아 두는 것을 권장합니다.")
+    st.caption("엑셀은 주소 정보만 백업합니다. 사내망 PC 이동에는 위의 전체 DB(SQLite) 백업을 사용하세요. Streamlit Cloud 로컬 디스크는 영구 보관을 보장하지 않습니다.")
 
     st.download_button(
         "📥 주소 DB 엑셀 백업",
