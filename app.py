@@ -2,6 +2,7 @@
 import io
 import os
 import json
+import hmac
 import tempfile
 import html
 import re
@@ -30,8 +31,6 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("🏢 법인 Finder")
-st.caption("법인명 + 본점/사업장 소재지 검색 · OpenDART 감사보고서/거래은행·차입금 분석 · 퇴직연금 유형 판별 대시보드 · v3.4 · 로컬 DB 우선")
 
 DART_BASE = "https://opendart.fss.or.kr/api"
 DART_ENG_BASE = "https://engopendart.fss.or.kr/engapi"
@@ -368,6 +367,33 @@ def get_secret(name, default=""):
     return os.getenv(name, default)
 
 
+def save_external_company_db(df: pd.DataFrame, mapped: dict):
+    """외부 XLSX/CSV의 정규화된 법인목록까지 SQLite에 영구 저장합니다."""
+    if df is None or df.empty:
+        raise ValueError('저장할 기업목록 데이터가 없습니다.')
+    with get_db_connection() as conn:
+        df.fillna('').astype(str).to_sql('external_company', conn, if_exists='replace', index=False)
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_external_corp_name ON external_company(norm_name)')
+        conn.execute("INSERT OR REPLACE INTO db_meta(meta_key,meta_value) VALUES('external_company_meta',?)",
+                     (json.dumps(mapped, ensure_ascii=False, default=str),))
+        conn.execute("INSERT OR REPLACE INTO db_meta(meta_key,meta_value) VALUES('external_company_updated_at',?)",
+                     (datetime.now().strftime('%Y-%m-%d %H:%M:%S'),))
+    _db_cloud_push()
+
+
+def load_external_company_db():
+    with get_db_connection() as conn:
+        found=conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='external_company'").fetchone()
+        if not found:
+            return pd.DataFrame(), {}
+        df=pd.read_sql_query('SELECT * FROM external_company',conn).fillna('')
+    try:
+        meta=json.loads(get_db_meta('external_company_meta','{}'))
+    except (ValueError, TypeError):
+        meta={}
+    return df, meta
+
+
 def normalize_company_name(name: str) -> str:
     if not name:
         return ""
@@ -558,6 +584,7 @@ def save_company_analysis(result: dict):
             "result_json=excluded.result_json, analyzed_at=excluded.analyzed_at",
             (code, payload, now),
         )
+    _db_cloud_push()
 
 
 def get_saved_company_analysis(corp_code: str):
@@ -614,6 +641,172 @@ def restore_full_db_bytes(raw: bytes):
         if src is not None: src.close()
         if dst is not None: dst.close()
         tmp.unlink(missing_ok=True)
+
+
+# =========================================================
+# HANAV CLOUD SQLITE SYNC — PRIVATE SUPABASE STORAGE
+# Last good snapshot is kept remotely, and restored on a new server start.
+# SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_BUCKET are server secrets.
+# Never expose the service-role key in the repository or the UI.
+# =========================================================
+import hashlib as _db_hashlib
+import tempfile as _db_tempfile
+from urllib.parse import quote as _db_quote
+
+_DB_CLOUD_OBJECT = 'corporate/corp_finder_cache.sqlite3'
+_DB_CLOUD_CONFIG_ERROR = ''
+
+
+def _db_cloud_config():
+    url = str(get_secret('SUPABASE_URL') or '').strip().rstrip('/')
+    key = str(get_secret('SUPABASE_SERVICE_ROLE_KEY') or '').strip()
+    bucket = str(get_secret('SUPABASE_BUCKET') or 'hanav-finder-db').strip()
+    if not url or not key:
+        return None
+    if not url.startswith('https://'):
+        raise RuntimeError('SUPABASE_URL은 https:// 주소여야 합니다.')
+    if not bucket or '/' in bucket or '..' in bucket:
+        raise RuntimeError('SUPABASE_BUCKET 설정을 확인해 주세요.')
+    prefix = url + '/storage/v1/object/'
+    suffix = _db_quote(bucket, safe='') + '/' + _db_quote(_DB_CLOUD_OBJECT, safe='/')
+    return {'read_url': prefix + 'authenticated/' + suffix,
+             'write_url': prefix + suffix,
+             'headers': {'apikey': key, 'Authorization': 'Bearer ' + key},
+             'bucket': bucket}
+
+
+def _db_valid_snapshot(raw):
+    if not raw or not raw.startswith(b'SQLite format 3\x00'):
+        raise ValueError('백업 파일이 SQLite 형식이 아닙니다.')
+    with _db_tempfile.NamedTemporaryFile(suffix='.sqlite3', delete=False) as f:
+        f.write(raw)
+        tmp = Path(f.name)
+    try:
+        with sqlite3.connect(str(tmp)) as conn:
+            if conn.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+                raise ValueError('DB 무결성 검사에 실패했습니다.')
+            tables = {x[0] for x in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )}
+            required = {'corp_master', 'company_profile'}
+            if not required.issubset(tables):
+                raise ValueError('다른 종류의 DB 파일이 저장되어 있습니다.')
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _db_sqlite_snapshot():
+    path = DB_PATH
+    if not path.exists():
+        raise FileNotFoundError('저장된 로컬 DB가 없습니다.')
+    with _db_tempfile.NamedTemporaryFile(suffix='.sqlite3', delete=False) as f:
+        tmp = Path(f.name)
+    try:
+        with sqlite3.connect(str(path), timeout=30) as src, sqlite3.connect(str(tmp)) as dst:
+            src.backup(dst)  # WAL에 아직 남아 있는 데이터까지 포함
+        raw = tmp.read_bytes()
+        _db_valid_snapshot(raw)
+        return raw
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _db_install_snapshot(raw):
+    _db_valid_snapshot(raw)
+    with _db_tempfile.NamedTemporaryFile(suffix='.sqlite3', delete=False) as f:
+        f.write(raw)
+        tmp = Path(f.name)
+    try:
+        restore_full_db_bytes(raw)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _db_cloud_push(show_feedback=False):
+    cfg = _db_cloud_config()
+    if cfg is None:
+        return False
+    try:
+        raw = _db_sqlite_snapshot()
+        headers = dict(cfg['headers'])
+        headers.update({'Content-Type': 'application/x-sqlite3',
+                        'x-upsert': 'true', 'cache-control': 'no-cache'})
+        response = requests.post(cfg['write_url'], headers=headers, data=raw,
+                                 timeout=(10, 180))
+        response.raise_for_status()
+        st.session_state['_db_cloud_saved_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        st.session_state.pop('_db_cloud_error', None)
+        if show_feedback:
+            st.success('☁️ 최신 SQLite DB가 비공개 저장소에 백업되었습니다.')
+        return True
+    except Exception as exc:
+        st.session_state['_db_cloud_error'] = str(exc)
+        if show_feedback:
+            st.error(f'클라우드 DB 백업 실패. 현재 서버의 DB는 유지됩니다: {exc}')
+        return False
+
+
+def _db_cloud_restore_on_boot():
+    # Once per Python process, before SQLite access. All browser sessions share it.
+    cfg = _db_cloud_config()
+    if cfg is None:
+        return 'not_configured'
+    try:
+        response = requests.get(cfg['read_url'], headers=cfg['headers'],
+                                timeout=(10, 180))
+        if response.status_code == 404:
+            # Storage is empty: seed it with a preexisting, valid DB if present.
+            if DB_PATH.exists():
+                try:
+                    _db_valid_snapshot(_db_sqlite_snapshot())
+                    if _db_cloud_push():
+                        return 'seeded'
+                except Exception:
+                    pass
+            return 'remote_empty'
+        response.raise_for_status()
+        _db_install_snapshot(response.content)
+        return 'restored'
+    except Exception as exc:
+        st.session_state['_db_cloud_error'] = '초기 DB 동기화 실패: ' + str(exc)
+        return 'offline_fallback'
+
+
+@st.cache_resource(show_spinner=False)
+def _db_boot_once(bucket_object, config_fingerprint):
+    # No key in cache key: fingerprint only, not the secret. Cache is per server.
+    return _db_cloud_restore_on_boot()
+
+
+def _db_startup_restore():
+    try:
+        cfg = _db_cloud_config()
+        fingerprint = _db_hashlib.sha256(
+            (cfg['read_url'] + cfg['headers']['apikey']).encode('utf-8')
+        ).hexdigest() if cfg else 'disabled'
+        return _db_boot_once(_DB_CLOUD_OBJECT, fingerprint)
+    except Exception as exc:
+        st.session_state['_db_cloud_error'] = str(exc)
+        return 'invalid_config'
+
+
+def _db_cloud_indicator():
+    try:
+        cfg = _db_cloud_config()
+    except Exception as exc:
+        st.error(f'클라우드 DB 설정 오류: {exc}')
+        return
+    if cfg is None:
+        st.warning('영구 DB 동기화 미설정: SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY가 필요합니다. 현재 SQLite는 재배포 시 사라질 수 있습니다.')
+    else:
+        if st.session_state.get('_db_cloud_error'):
+            st.warning('☁️ 최근 동기화 오류: ' + st.session_state['_db_cloud_error'])
+        else:
+            st.caption('☁️ 비공개 클라우드 DB 연결됨 · 서버 재시작 시 마지막 저장본 자동 복원')
+        if st.session_state.get('_db_cloud_saved_at'):
+            st.caption('마지막 클라우드 백업: ' + st.session_state['_db_cloud_saved_at'])
+        if st.button('☁️ 현재 DB 영구 저장', key='corp' + '_cloud_save_btn'):
+            _db_cloud_push(show_feedback=True)
 
 
 def sync_corp_master(corp_df: pd.DataFrame):
@@ -694,7 +887,7 @@ def get_missing_profiles(batch_size=100, listed_first=True, retry_errors=False):
     return [dict(r) for r in rows]
 
 
-def save_company_profile(master_row: dict, company: dict | None = None, error: str = ""):
+def save_company_profile(master_row: dict, company: dict | None = None, error: str = "", *, persist: bool = True):
     company = company or {}
     values = (
         master_row.get("corp_code", ""),
@@ -741,6 +934,8 @@ def save_company_profile(master_row: dict, company: dict | None = None, error: s
             """,
             values,
         )
+    if persist:
+        _db_cloud_push()
 
 
 def fetch_company_info_uncached(api_key: str, corp_code: str) -> dict:
@@ -764,19 +959,23 @@ def build_address_cache(api_key: str, batch_size=100, listed_first=True, retry_e
         status_box.write(f"주소 DB 구축 {idx}/{len(targets)} · {row['corp_name']}")
         try:
             info = fetch_company_info_uncached(api_key, row["corp_code"])
-            save_company_profile(row, info, "")
+            save_company_profile(row, info, "", persist=False)
             ok += 1
         except Exception as exc:
             msg = str(exc)
-            save_company_profile(row, {}, msg)
+            save_company_profile(row, {}, msg, persist=False)
             fail += 1
             if "요청 제한" in msg or "020" in msg:
                 status_box.warning("OpenDART 요청 한도에 도달해 이번 주소 DB 구축을 중단했습니다. 다음 이용 가능 시점에 이어서 실행하면 됩니다.")
                 progress.progress(idx / len(targets))
+                if ok or fail:
+                    _db_cloud_push()
                 return ok, fail
         progress.progress(idx / len(targets))
 
     status_box.empty()
+    if ok or fail:
+        _db_cloud_push()
     return ok, fail
 
 
@@ -853,7 +1052,7 @@ def import_address_cache_file(uploaded_file):
                 "adres": str(r.get("adres", "")), "hm_url": str(r.get("hm_url", "")),
                 "phn_no": str(r.get("phn_no", "")), "induty_code": str(r.get("induty_code", "")),
             }
-            save_company_profile(master_row, company, str(r.get("fetch_error", "")))
+            save_company_profile(master_row, company, str(r.get("fetch_error", "")), persist=False)
             count += 1
     return count
 
@@ -1689,25 +1888,59 @@ def make_excel(results):
 
 
 # =========================================================
-# 로그인 (선택)
+# LOGIN — MATCHES HANAV ETF FINDER
 # =========================================================
-APP_PASSWORD = str(get_secret("APP_PASSWORD", "")).strip()
+st.markdown("""
+<style>
+:root {color-scheme:light;--primary-color:#008878;--background-color:#F4F8F7}
+.stApp,[data-testid="stAppViewContainer"]{background:#F4F8F7;color:#203D35}
+.block-container{max-width:1500px;padding-top:1rem}
+input{color:#203D35!important}
+.stButton>button[kind="primary"]{background:#008878!important;border-color:#008878!important;color:white!important}
+</style>
+""",unsafe_allow_html=True)
 
-if APP_PASSWORD:
-    if "corp_finder_auth" not in st.session_state:
-        st.session_state.corp_finder_auth = False
+def _corp_app_password():
+    return str(get_secret('APP_PASSWORD','') or '')
 
-    if not st.session_state.corp_finder_auth:
-        st.subheader("🔒 접속 비밀번호")
-        pwd = st.text_input("비밀번호", type="password")
-        if st.button("접속", type="primary"):
-            if pwd == APP_PASSWORD:
-                st.session_state.corp_finder_auth = True
-                st.rerun()
-            else:
-                st.error("비밀번호가 맞지 않습니다.")
-        st.stop()
+def _corp_check_password():
+    expected=_corp_app_password()
+    entered=str(st.session_state.get('_corp_password',''))
+    ok=bool(expected) and hmac.compare_digest(entered.encode('utf-8'),expected.encode('utf-8'))
+    st.session_state['_corp_authenticated']=ok
+    st.session_state['_corp_login_error']=not ok
+    st.session_state['_corp_password']=''
 
+def _corp_logout():
+    for key in list(st.session_state):
+        del st.session_state[key]
+
+st.session_state.setdefault('_corp_authenticated',False)
+st.session_state.setdefault('_corp_login_error',False)
+if not _corp_app_password():
+    st.error('APP_PASSWORD가 설정되지 않았습니다. Streamlit Secrets에 APP_PASSWORD를 등록해 주세요.')
+    st.stop()
+if not st.session_state['_corp_authenticated']:
+    st.markdown('''
+    <div style="max-width:430px;margin:11vh auto 22px;text-align:center;">
+       <div style="font-size:34px;font-weight:950;color:#008878;">Corporate Finder</div>
+       <div style="margin-top:7px;color:#536F64;font-size:13px;font-weight:650;">Private Corporate Intelligence Dashboard</div>
+       <div style="margin-top:4px;color:#60766E;font-size:11px;">Designed &amp; Built by K.H. Ahn</div>
+    </div>''',unsafe_allow_html=True)
+    _left,_center,_right=st.columns([1,1.15,1])
+    with _center:
+        with st.form('_corp_login_form'):
+            st.text_input('비밀번호',type='password',key='_corp_password',placeholder='비밀번호를 입력하세요')
+            st.form_submit_button('🔐 로그인',type='primary',use_container_width=True,on_click=_corp_check_password)
+        if st.session_state.get('_corp_login_error'):
+            st.error('비밀번호가 올바르지 않습니다.')
+    st.stop()
+
+_, _logout_col=st.columns([5,1])
+with _logout_col:
+    st.button('🔒 로그아웃',key='_corp_logout_btn',use_container_width=True,on_click=_corp_logout)
+st.title('🏢 Corporate Finder')
+st.caption('법인명·본점 소재지 검색 · 감사보고서 거래은행/퇴직연금 · 마지막 DB 자동 복원')
 
 # =========================================================
 # 로컬 DB 먼저 실행: 온라인 업데이트는 명시적으로 요청할 때만
@@ -1721,6 +1954,7 @@ offline_mode = st.checkbox(
 dart_enabled = bool(api_key) and not offline_mode
 
 try:
+    _db_startup_state = _db_startup_restore()
     init_local_db()
     corp_df = load_saved_corp_master()
 except Exception as e:
@@ -1734,21 +1968,35 @@ if corp_df.empty and dart_enabled:
             fresh_df = load_corp_codes(api_key)
             sync_corp_master(fresh_df)
             set_db_meta("corp_master_updated_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            _db_cloud_push()
             corp_df = load_saved_corp_master()
     except Exception as e:
         st.error(f"최초 DART 법인목록 구축에 실패했습니다: {type(e).__name__}: {e}")
 
 if corp_df.empty:
+    _db_cloud_indicator()
     st.warning("아직 저장된 법인 DB가 없습니다. 인터넷이 되는 PC에서 최초 DB를 구축하거나 전체 SQLite 백업파일을 복원해 주세요.")
     startup_restore = st.file_uploader("전체 SQLite DB 백업 복원", type=["sqlite3", "db"], key="startup_full_restore")
     if startup_restore is not None and st.button("저장 DB 복원", type="primary", key="startup_full_restore_btn"):
         try:
             restore_full_db_bytes(startup_restore.getvalue())
+            _db_cloud_push()
             st.success("DB를 복원했습니다.")
             st.rerun()
         except Exception as exc:
             st.error(f"복원 실패: {exc}")
     st.stop()
+
+_db_cloud_indicator()
+if 'external_company_df' not in st.session_state:
+    try:
+        _saved_external, _saved_columns = load_external_company_db()
+        if not _saved_external.empty:
+            st.session_state['external_company_df'] = _saved_external
+            st.session_state['external_mapped_cols'] = _saved_columns
+            st.session_state['external_file_sig'] = 'saved-db'
+    except Exception as _ext_exc:
+        st.warning(f'저장된 외부 기업목록 불러오기 실패: {_ext_exc}')
 
 last_db_sync = get_db_meta("corp_master_updated_at", "기존 저장본 (갱신일 기록 없음)")
 mode_label = "오프라인" if not dart_enabled else "로컬 DB 우선"
@@ -1760,6 +2008,7 @@ if st.button("🔄 DART 법인목록 최신 업데이트", disabled=not dart_ena
             fresh_df = load_corp_codes(api_key)
             sync_corp_master(fresh_df)
             set_db_meta("corp_master_updated_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            _db_cloud_push()
         st.success("최신 법인목록을 로컬 DB에 저장했습니다.")
         st.rerun()
     except Exception as exc:
@@ -1914,6 +2163,8 @@ with region_tab:
     source_mode = st.radio(
         "검색 데이터",
         ["DART 주소 DB", "외부 기업목록", "둘 다"],
+        index=2 if isinstance(st.session_state.get('external_company_df'), pd.DataFrame)
+                 and not st.session_state['external_company_df'].empty else 0,
         horizontal=True,
         key="region_source_mode",
         help="DART 주소 DB=본점 소재지, 외부 기업목록=본점/공장/사업장 등 파일에 들어 있는 주소 기준",
@@ -1937,15 +2188,21 @@ with region_tab:
             if st.session_state.get("external_file_sig") != file_sig:
                 try:
                     ext_df, mapped = read_external_company_file(uploaded)
+                    save_external_company_db(ext_df, mapped)
                     st.session_state["external_company_df"] = ext_df
                     st.session_state["external_file_sig"] = file_sig
                     st.session_state["external_mapped_cols"] = mapped
                 except Exception as e:
                     st.error(f"외부 기업목록 읽기 실패: {e}")
             if "external_company_df" in st.session_state:
-                st.success(f"외부 기업목록 {len(st.session_state['external_company_df']):,}개 불러옴")
+                st.success(f"외부 기업목록 {len(st.session_state['external_company_df']):,}개 불러옴 · SQLite 자동 저장")
                 with st.expander("인식된 열 확인"):
                     st.json(st.session_state.get("external_mapped_cols", {}))
+
+        if uploaded is None and isinstance(st.session_state.get('external_company_df'), pd.DataFrame):
+            _ext_df = st.session_state['external_company_df']
+            if not _ext_df.empty:
+                st.success(f'💾 마지막으로 저장한 외부 기업목록 {_ext_df.shape[0]:,}개 자동 불러옴 · 파일 재업로드 불필요')
 
         st.link_button(
             "📥 2025 충청북도 제조업체 총람 다운로드 페이지",
@@ -2300,6 +2557,7 @@ with db_tab:
     if full_restore_file is not None and st.button("전체 DB 복원 실행", key="full_db_restore_btn"):
         try:
             restore_full_db_bytes(full_restore_file.getvalue())
+            _db_cloud_push()
             st.success("전체 DB 복원 완료. 법인 목록을 다시 불러옵니다.")
             st.rerun()
         except Exception as exc:
@@ -2348,6 +2606,7 @@ with db_tab:
     if restore_file is not None and st.button("주소 DB 복원 실행", key="db_restore_btn"):
         try:
             count = import_address_cache_file(restore_file)
+            _db_cloud_push()
             st.success(f"주소 DB {count:,}건을 복원했습니다.")
             st.rerun()
         except Exception as e:
