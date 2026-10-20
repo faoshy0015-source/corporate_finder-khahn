@@ -7,6 +7,7 @@ import tempfile
 import html
 import re
 import ssl
+import time
 import sqlite3
 import zipfile
 import xml.etree.ElementTree as ET
@@ -189,15 +190,8 @@ class DARTSSLAdapter(HTTPAdapter):
 
 
 def _retry_policy():
-    return Retry(
-        total=3,
-        connect=3,
-        read=3,
-        backoff_factor=0.7,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(["GET"]),
-        raise_on_status=False,
-    )
+    # 접속 차단 시 30초 x 4회 지연되는 현상 방지. 서버 재시도는 사용자가 명시적으로 다시 시도.
+    return Retry(total=0, connect=0, read=0, redirect=0, backoff_factor=0)
 
 
 @st.cache_resource
@@ -253,39 +247,97 @@ def _to_eng_dart_url(url: str) -> str:
     return url
 
 
-def dart_get(url, **kwargs):
-    """OpenDART 연결.
+def _dart_safe_error(exc: Exception) -> str:
+    """API 키가 포함된 원본 요청 URL/예외 메시지를 UI로 내보내지 않는다."""
+    if isinstance(exc, requests.exceptions.ConnectTimeout):
+        return "연결 시간 초과"
+    if isinstance(exc, requests.exceptions.ReadTimeout):
+        return "서버 응답 시간 초과"
+    if isinstance(exc, requests.exceptions.SSLError):
+        return "SSL 보안 연결 실패"
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        return "네트워크 연결 실패"
+    if isinstance(exc, requests.exceptions.HTTPError):
+        response = getattr(exc, "response", None)
+        return f"HTTP {response.status_code}" if response is not None else "HTTP 응답 오류"
+    if isinstance(exc, requests.exceptions.RequestException):
+        return type(exc).__name__
+    return type(exc).__name__
 
-    1) 국문 API 우선
-    2) Windows DH_KEY_TOO_SMALL이면 로컬 SSL 호환모드 재시도
-    3) Streamlit Cloud 등에서 국문 도메인 ConnectTimeout/ConnectionError가 나면
-       금융감독원 공식 영문 OpenDART(engopendart)로 자동 우회
-    """
-    primary_kwargs = dict(kwargs)
-    # Streamlit Cloud처럼 국문 DART 경로가 차단된 경우 60~90초씩 기다리지 않게
-    # 연결(connect) 단계만 8초로 제한하고, 응답(read) 대기시간은 기존 값을 유지합니다.
-    if url.startswith("https://opendart.fss.or.kr/api/"):
-        t = primary_kwargs.get("timeout", 30)
-        if isinstance(t, (int, float)):
-            primary_kwargs["timeout"] = (8, t)
+
+def _check_dart_http(response):
+    """raise_for_status 예외가 인증키 포함 URL을 노출하지 않도록 한다."""
+    if not (200 <= response.status_code < 300):
+        raise RuntimeError(f"DART HTTP 응답 오류 ({response.status_code})")
+
+
+def dart_get(url, **kwargs):
+    """국문 우선, 연결 실패 시 공식 영문 API 1회 우회. 네트워크 오류는 키 없이 표시."""
+    original_timeout = kwargs.get("timeout", 30)
+    if isinstance(original_timeout, (tuple, list)):
+        read_timeout = original_timeout[1]
+    else:
+        read_timeout = original_timeout
+    # 연결 제한만 4초, 보고서 원문 다운로드의 읽기 제한은 기존 최대 90초 유지.
+    short_kwargs = dict(kwargs)
+    short_kwargs["timeout"] = (4, read_timeout)
     try:
-        return get_dart_primary_session().get(url, **primary_kwargs)
-    except requests.exceptions.SSLError as e:
-        msg = str(e).upper()
-        if "DH_KEY_TOO_SMALL" in msg or "DH KEY TOO SMALL" in msg:
+        return get_dart_primary_session().get(url, **short_kwargs)
+    except requests.exceptions.SSLError as exc:
+        # 일부 로컬 Windows의 DH_KEY_TOO_SMALL 오류에만 약한 SSL 호환 모드 적용.
+        if "DH_KEY_TOO_SMALL" in str(exc).upper() or "DH KEY TOO SMALL" in str(exc).upper():
             try:
-                return get_dart_legacy_session().get(url, **kwargs)
-            except (requests.exceptions.ConnectTimeout, requests.exceptions.ConnectionError):
-                eng_url = _to_eng_dart_url(url)
-                if eng_url != url:
-                    return get_dart_default_session().get(eng_url, **kwargs)
-                raise
-        raise
-    except (requests.exceptions.ConnectTimeout, requests.exceptions.ConnectionError):
-        eng_url = _to_eng_dart_url(url)
-        if eng_url != url:
-            return get_dart_default_session().get(eng_url, **kwargs)
-        raise
+                return get_dart_legacy_session().get(url, **short_kwargs)
+            except requests.exceptions.RequestException:
+                pass
+        else:
+            raise RuntimeError("DART 국문 서버 SSL 연결 실패") from None
+    except (requests.exceptions.ConnectTimeout, requests.exceptions.ConnectionError,
+            requests.exceptions.ReadTimeout):
+        pass
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(f"DART 국문 서버 요청 실패: {_dart_safe_error(exc)}") from None
+
+    alt = _to_eng_dart_url(url)
+    if alt == url:
+        raise RuntimeError("DART 국문 서버에 연결되지 않았습니다.")
+    try:
+        # 영문 도메인도 1회만 접속한다. 기존 3회 재시도 제거.
+        return get_dart_default_session().get(alt, **short_kwargs)
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(
+            "DART 국문·영문 서버 연결 실패: " + _dart_safe_error(exc)
+            + ". Streamlit Cloud ↔ DART 연결 상태를 점검해 주세요."
+        ) from None
+
+
+def check_dart_connection(api_key: str, corp_code: str):
+    """국문/영문 공시목록 API를 독립적으로 테스트한다(인증키 비노출)."""
+    endpoints = [("국문", f"{DART_BASE}/list.json"),
+                 ("영문", f"{DART_ENG_BASE}/list.json")]
+    checks = []
+    params = {"crtfc_key": api_key, "corp_code": corp_code,
+              "bgn_de": (date.today() - timedelta(days=365)).strftime("%Y%m%d"),
+              "end_de": date.today().strftime("%Y%m%d"),
+              "page_count": 1}
+    for label, endpoint in endpoints:
+        started = time.perf_counter()
+        try:
+            r = get_dart_primary_session().get(endpoint, params=params, timeout=(3, 5))
+            status = f"HTTP {r.status_code}"
+            if r.ok:
+                try:
+                    data = r.json()
+                    status += f" / DART {data.get('status', '응답 확인')}"
+                except (ValueError, AttributeError):
+                    status += " / JSON 해석 불가"
+            checks.append({"접속경로": label, "결과": status,
+                           "소요시간(초)": round(time.perf_counter()-started, 1)})
+        except requests.exceptions.RequestException as exc:
+            checks.append({"접속경로": label, "결과": _dart_safe_error(exc),
+                           "소요시간(초)": round(time.perf_counter()-started, 1)})
+    return checks
+
 
 BANK_PATTERNS = {
     "하나은행": [
@@ -404,7 +456,7 @@ def normalize_company_name(name: str) -> str:
 
 def request_json(url, params, timeout=30):
     r = dart_get(url, params=params, timeout=timeout)
-    r.raise_for_status()
+    _check_dart_http(r)
     data = r.json()
     status = str(data.get("status", "000"))
     # 013은 조회된 데이터가 없다는 정상적인 빈 결과 코드
@@ -1300,7 +1352,7 @@ def region_terms_from_inputs(province, city, district, town):
 def load_corp_codes(api_key: str) -> pd.DataFrame:
     url = f"{DART_BASE}/corpCode.xml"
     r = dart_get(url, params={"crtfc_key": api_key}, timeout=60)
-    r.raise_for_status()
+    _check_dart_http(r)
 
     try:
         zf = zipfile.ZipFile(io.BytesIO(r.content))
@@ -1394,7 +1446,7 @@ def download_disclosure_text(api_key: str, rcept_no: str) -> str:
         params={"crtfc_key": api_key, "rcept_no": rcept_no},
         timeout=90,
     )
-    r.raise_for_status()
+    _check_dart_http(r)
 
     try:
         zf = zipfile.ZipFile(io.BytesIO(r.content))
@@ -1745,8 +1797,15 @@ def _analyze_company_online(api_key: str, corp_row: dict):
     corp_code = corp_row["corp_code"]
     corp_name = corp_row["corp_name"]
 
-    company = get_company_info(api_key, corp_code)
-    disclosures = get_disclosures(api_key, corp_code)
+    # 저장된 기업개황을 이용한다. company.json은 부가정보이므로
+    # DART 연결이 불안정할 때 감사보고서 분석을 막지 않도록 강제 재호출하지 않는다.
+    company = get_saved_company_profile(str(corp_code)) or {}
+    try:
+        disclosures = get_disclosures(api_key, corp_code)
+    except Exception as exc:
+        if isinstance(exc, (RuntimeError, requests.exceptions.RequestException)):
+            raise RuntimeError(f"DART 공시목록(list.json) 조회 실패: {exc if isinstance(exc, RuntimeError) else _dart_safe_error(exc)}") from None
+        raise
     report = pick_latest_audit_report(disclosures)
 
     base = {
@@ -1771,7 +1830,12 @@ def _analyze_company_online(api_key: str, corp_row: dict):
         }
 
     rcept_no = str(report.get("rcept_no", ""))
-    text = download_disclosure_text(api_key, rcept_no)
+    try:
+        text = download_disclosure_text(api_key, rcept_no)
+    except Exception as exc:
+        if isinstance(exc, (RuntimeError, requests.exceptions.RequestException)):
+            raise RuntimeError(f"DART 감사보고서 원문(document.xml) 다운로드 실패: {exc if isinstance(exc, RuntimeError) else _dart_safe_error(exc)}") from None
+        raise
     banks, generic = bank_hits_in_text(text)
     pension = analyze_pension_text(text)
 
@@ -1792,22 +1856,30 @@ def _analyze_company_online(api_key: str, corp_row: dict):
     }
 
 
-def analyze_company(api_key: str, corp_row: dict):
-    """온라인에서는 신규 분석 결과 저장, 오프라인에서는 마지막 분석 결과 사용."""
+def analyze_company(api_key: str, corp_row: dict, *, refresh=False):
+    """기존 분석은 즉시 표시. 사용자가 명시적으로 요청해야 DART로 최신 갱신한다."""
     code = str(corp_row.get("corp_code", ""))
     cached, analyzed_at = get_saved_company_analysis(code)
     if not dart_enabled:
         if cached is None:
-            raise RuntimeError("저장된 감사보고서 분석 결과가 없습니다. 인터넷 PC에서 해당 법인을 한 번 분석한 뒤 DB를 옮겨 주세요.")
-        st.info(f"오프라인: {analyzed_at}에 저장된 거래은행·퇴직연금 분석 결과를 표시합니다. 최신 공시는 반영되지 않습니다.")
+            raise RuntimeError("저장된 분석 결과가 없습니다. DART 접속 가능할 때 해당 법인을 먼저 분석해 주세요.")
+        st.info(f"오프라인: {analyzed_at} 저장 결과 표시 (최신 공시 미반영)")
+        return cached
+    # 오류/미발견 결과만 있는 저장본은 자동 재조회해 재분석 기회를 보장한다.
+    usable_cache = bool(cached and cached.get("report") and not cached.get("error"))
+    if usable_cache and not refresh:
+        st.info(f"💾 {analyzed_at} 저장 분석 결과를 즉시 표시합니다. 최신 공시는 '최신 공시 재분석'을 눌러 주세요.")
         return cached
     try:
+        if refresh:
+            # 최신 공시 재분석에서는 30분짜리 공시목록 캐시를 해당 법인에 한해 무효화.
+            get_disclosures.clear(api_key, code)
         result = _analyze_company_online(api_key, corp_row)
         save_company_analysis(result)
         return result
-    except Exception as exc:
+    except Exception:
         if cached is not None:
-            st.warning(f"DART 신규 조회 실패로 {analyzed_at}에 저장된 분석 결과를 표시합니다. 원인: {type(exc).__name__}")
+            st.warning(f"DART 최신 조회에 실패해 {analyzed_at} 저장 분석 결과를 표시합니다. 연결 진단을 확인해 주세요.")
             return cached
         raise
 
@@ -2062,10 +2134,15 @@ with name_tab:
                     st.write(f"**본점 주소:** {info['adres']}")
                 st.write(f"**전화번호:** {info.get('phn_no') or '전화번호 미공개'}")
 
-            if st.button("거래은행 + 퇴직연금 통합 분석", type="primary", key="single_analyze"):
+            _name_c1, _name_c2 = st.columns([2, 1])
+            with _name_c1:
+                _name_run = st.button("거래은행 + 퇴직연금 통합 분석", type="primary", key="single_analyze")
+            with _name_c2:
+                _name_refresh = st.button("🔄 최신 공시 재분석", key="single_analyze_refresh", disabled=not dart_enabled)
+            if _name_run or _name_refresh:
                 try:
-                    with st.spinner("최근 감사보고서를 찾고 금융기관 관련 내용을 분석 중입니다..."):
-                        result = analyze_company(api_key, selected)
+                    with st.spinner("저장 결과 확인 또는 DART 감사보고서 분석 중입니다..."):
+                        result = analyze_company(api_key, selected, refresh=_name_refresh)
                     st.session_state["single_result"] = result
                 except Exception as e:
                     st.error(f"분석 중 오류: {e}")
@@ -2337,19 +2414,25 @@ with region_tab:
                 selected_corp = candidate_rows[labels.index(sel_label)]
 
                 st.info("이 회사를 선택하면 감사보고서에서 거래은행·금융거래 근거와 퇴직연금 관련 공시를 함께 분석합니다.")
-                if st.button("🏦 거래은행 · 차입금 · 퇴직연금 분석", type="primary", key="region_analyze_btn"):
+                _rg_c1, _rg_c2, _rg_c3 = st.columns([2.2, 1.2, 1.1])
+                with _rg_c1:
+                    _rg_run = st.button("🏦 거래은행 · 차입금 · 퇴직연금 분석", type="primary", key="region_analyze_btn")
+                with _rg_c2:
+                    _rg_refresh = st.button("🔄 최신 공시 재분석", key="region_analyze_refresh", disabled=not dart_enabled)
+                with _rg_c3:
+                    _rg_diagnose = st.button("🔌 DART 연결 진단", key="region_dart_diagnose", disabled=not dart_enabled)
+                if _rg_run or _rg_refresh:
                     try:
-                        with st.spinner("DART 감사보고서에서 거래은행·차입금·담보·예금·약정 정보를 분석 중입니다..."):
-                            result = analyze_company(api_key, selected_corp)
+                        with st.spinner("저장 결과 확인 또는 DART 감사보고서 분석 중입니다..."):
+                            result = analyze_company(api_key, selected_corp, refresh=_rg_refresh)
                         st.session_state["region_analysis_result"] = result
-                        if dart_enabled:
-                            try:
-                                profile = get_company_info(api_key, selected_corp["corp_code"])
-                                save_company_profile(selected_corp, profile, "")
-                            except Exception:
-                                pass
                     except Exception as e:
                         st.error(f"분석 중 오류: {e}")
+                if _rg_diagnose:
+                    with st.spinner("DART 국문·영문 공시목록 연결을 각각 확인 중입니다..."):
+                        _rg_checks = check_dart_connection(api_key, selected_corp["corp_code"])
+                    st.dataframe(pd.DataFrame(_rg_checks), hide_index=True, use_container_width=True)
+                    st.caption("HTTP 200 / DART 000은 조회 성공, DART 013은 공시자료 없음입니다. 접속 실패면 서버/네트워크 문제입니다.")
 
         rr = st.session_state.get("region_analysis_result")
         if rr:
@@ -2481,12 +2564,7 @@ with bulk_tab:
                     try:
                         result = analyze_company(api_key, selected)
                         results.append(result)
-                        if dart_enabled:
-                            try:
-                                profile = get_company_info(api_key, selected["corp_code"])
-                                save_company_profile(selected, profile, "")
-                            except Exception:
-                                pass
+                        # 감사보고서 분석 이후 company.json을 중복 호출하지 않는다.
                     except Exception as e:
                         results.append({
                             "company": {
