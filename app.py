@@ -1959,6 +1959,382 @@ def make_excel(results):
     return output.getvalue()
 
 
+
+# =========================================================
+# A4 현장 방문용 요약 보고서 (PDF + 편집가능 Excel)
+# 분석결과를 표시할 때만 메모리에서 생성. DB/DART/Supabase 변경 없음.
+# =========================================================
+def _visit_text(value, fallback='-'):
+    """DART/외부기업목록의 원문을 보고서에 안전한 한 줄로 정리."""
+    if value is None:
+        return fallback
+    v = re.sub(r'\s+', ' ', str(value)).strip()
+    return v if v and v.lower() not in ('nan', 'none') else fallback
+
+
+def _visit_cut(s, limit=36):
+    s = _visit_text(s)
+    return s if len(s) <= limit else s[:limit-1].rstrip() + '…'
+
+
+def _visit_filename(name):
+    # Windows/모바일 파일 저장 시 사용할 수 없는 문자를 제거.
+    value = re.sub(r'[\\/:*?"<>|]+', '_', _visit_text(name, '법인'))
+    return (value.strip(' .') or '법인')[:60]
+
+
+def _visit_report_context(result, external_meta=None):
+    c = result.get('company') or {}
+    rep = result.get('report') or {}
+    pen = result.get('pension') or {}
+    ext = external_meta or {}
+    banks = list(result.get('banks') or [])
+    # 공시에서 '차입/대출' 문맥이 있는 금융기관을 우선 표시한다.
+    banks.sort(key=lambda b: (0 if '차입/대출' in str(b.get('거래유형') or '') else 1,
+                              str(b.get('은행') or '')))
+    bank_rows=[]
+    for b in banks:
+        bank_rows.append({
+            'bank': _visit_text(b.get('은행')),
+            'type': _visit_text(b.get('거래유형'), '은행명 확인'),
+            'amount': _visit_text(b.get('금액표기'), '미확인'),
+            'strength': _visit_text(b.get('확인강도'), '미확인'),
+            'evidence': _visit_text(((_evidence_items(b) or [''])[0]), ''),
+        })
+    inst = [_visit_text(x.get('금융기관'), '') for x in (pen.get('연금기관후보') or [])]
+    inst = list(dict.fromkeys(i for i in inst if i))
+    report_date=_visit_text(rep.get('접수일'))
+    if report_date != '-' and re.fullmatch(r'\d{8}',report_date):
+        report_date=f'{report_date[:4]}.{report_date[4:6]}.{report_date[6:]}'
+    profile = None
+    # 불필요한 DART 요청 없이 저장된 기업개황만 참조한다.
+    try:
+        code = c.get('DART고유번호')
+        if code:
+            profile = get_saved_company_profile(str(code))
+    except (ValueError, sqlite3.Error, OSError):
+        profile = None
+    profile=profile or {}
+    return {
+        'name': _visit_text(c.get('법인명') or ext.get('법인명')),
+        'ceo': _visit_text(c.get('대표자') or ext.get('대표자') or profile.get('ceo_nm')),
+        'phone': _visit_text(c.get('전화번호') or ext.get('전화번호') or profile.get('phn_no')),
+        'address': _visit_text(c.get('주소') or ext.get('주소') or profile.get('adres')),
+        'bizno': _visit_text(c.get('사업자등록번호') or ext.get('사업자등록번호')),
+        'jurino': _visit_text(c.get('법인등록번호') or ext.get('법인등록번호')),
+        'industry': _visit_text(ext.get('업종') or profile.get('induty_code'), '미확인'),
+        'dart_code': _visit_text(c.get('DART고유번호')),
+        'report_name': _visit_text(rep.get('보고서명'), '감사보고서 미확인'),
+        'report_date': report_date,
+        'report_url': _visit_text(rep.get('DART링크'), ''),
+        'generated': datetime.now().strftime('%Y.%m.%d'),
+        'banks': bank_rows,
+        'pension_type': _visit_text(pen.get('운영분류'), '확인 불가'),
+        'pension_confidence': _visit_text(pen.get('판별신뢰'), '판별 근거 없음'),
+        'pension_status': _visit_text(pen.get('판정'), '공시 근거 미확인'),
+        'pension_inst': ', '.join(inst) if inst else '퇴직연금 기관 미확인',
+        'db_count': len(pen.get('DB근거') or []),
+        'dc_count': len(pen.get('DC근거') or []),
+        'asset_count': len((pen.get('금액관련근거') or {}).get('사외적립자산') or []),
+        'error': _visit_text(result.get('error'), ''),
+    }
+
+
+def make_visit_report_excel(result, external_meta=None):
+    """기존 상세 엑셀과 별개의, 인쇄 설정이 적용된 편집가능한 A4 한 장짜리 보고서."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, PatternFill, Font, Border, Side
+    from openpyxl.worksheet.page import PageMargins
+    from openpyxl.utils import get_column_letter
+    d = _visit_report_context(result, external_meta)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = 'A4현장미팅보고서'
+    ws.sheet_view.showGridLines = False
+    ws.sheet_view.zoomScale = 85
+    for i,w in enumerate([12,12,13,13,13,13,12,12],1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    navy='18354F'; teal='008879'; dark='253849'; mid='526679'; light='EDF4F4'; white='FFFFFF'; grey='F2F5F7'; orange='FFF7E8'; line='D8E3E7'
+    edge=Side(style='thin', color=line)
+
+    def cellrow(row,text, start=1,end=8, *, height=20, size=10, color=dark,
+                bold=False, bg=None, align='left', indent=1, wrap=False):
+        ws.merge_cells(start_row=row,start_column=start,end_row=row,end_column=end)
+        for col in range(start,end+1):
+            x=ws.cell(row,col)
+            if bg: x.fill=PatternFill('solid',fgColor=bg)
+        t=ws.cell(row,start)
+        t.value=str(text)
+        t.font=Font(name='맑은 고딕',size=size,bold=bold,color=color)
+        t.alignment=Alignment(horizontal=align,vertical='center',indent=indent if align=='left' else 0,wrap_text=wrap)
+        ws.row_dimensions[row].height=max(height,ws.row_dimensions[row].height or 0)
+
+    def section(row,text):
+        cellrow(row,text,height=23,size=10,bold=True,color=white,bg=navy)
+
+    def dual(row, left_label,left_value,right_label,right_value):
+        cellrow(row,left_label,1,2,height=23,bg=grey,size=9,bold=True,color=mid)
+        cellrow(row,_visit_cut(left_value,25),3,4,size=9)
+        cellrow(row,right_label,5,6,bg=grey,size=9,bold=True,color=mid)
+        cellrow(row,_visit_cut(right_value,25),7,8,size=9)
+
+    cellrow(1,'CORPORATE FINDER | 현장 미팅 리포트',height=24,size=10,bold=True,color=teal)
+    cellrow(2,'법인 분석 요약 보고서',height=35,size=19,bold=True,color=white,bg=navy)
+    cellrow(3,f"{d['name']}  |  생성일 {d['generated']}  |  감사보고서 접수일 {d['report_date']}",height=24,size=10,bold=True,color=dark,bg=light)
+    ws.row_dimensions[4].height=7
+    section(5,'01  기업 기본정보')
+    dual(6,'대표자',d['ceo'],'전화번호',d['phone'])
+    dual(7,'사업자번호',d['bizno'],'법인번호',d['jurino'])
+    cellrow(8,'본점 주소',1,2,height=23,bg=grey,size=9,bold=True,color=mid)
+    cellrow(8,_visit_cut(d['address'],80),3,8,size=9)
+    cellrow(9,'업종 / 코드',1,2,height=23,bg=grey,size=9,bold=True,color=mid)
+    cellrow(9,_visit_cut(d['industry'],80),3,8,size=9)
+    cellrow(10,f"공시 기준: {_visit_cut(d['report_name'],75)}  |  DART {d['dart_code']}",height=18,size=8,color=mid)
+    ws.row_dimensions[11].height=7
+    section(12,'02  차입금 · 거래 금융기관 (감사보고서 원문 기반)')
+    for a,b,label in [(1,2,'금융기관'),(3,4,'거래유형'),(5,7,'금액 표기(미검증)'),(8,8,'근거강도')]:
+        cellrow(13,label,a,b,height=22,bg=light,size=8,bold=True,color=mid,align='center',indent=0)
+    visible=d['banks'][:4]
+    for k in range(4):
+        r=14+k
+        b=visible[k] if k<len(visible) else {}
+        bg=white if k%2==0 else grey
+        for a,e,v in [(1,2,_visit_cut(b.get('bank',''),19)),(3,4,_visit_cut(b.get('type',''),22)),
+                      (5,7,_visit_cut(b.get('amount',''),32)),(8,8,b.get('strength',''))]:
+            cellrow(r,v,a,e,height=21,size=9,bg=bg,align='center' if a==8 else 'left',indent=0 if a==8 else 1)
+    remaining=max(0,len(d['banks'])-len(visible))
+    if remaining:
+        cellrow(18,f'※ 추가 금융기관 {remaining}곳은 기존 상세 엑셀/화면에서 확인',height=19,size=8,color=mid)
+    else:
+        cellrow(18,'※ 위 금액은 감사보고서 문맥에서 추출한 표기이며 차입금 잔액 합계로 확정하지 않습니다.',height=19,size=8,color=mid)
+    summary_evidence=next((x['evidence'] for x in d['banks'] if x.get('evidence')), '')
+    cellrow(19,'대표 공시 근거(발췌): '+_visit_cut(summary_evidence or '은행 관련 공시 근거 미확인',114),height=29,size=8,color=mid,bg=grey,wrap=True)
+    ws.row_dimensions[20].height=7
+    section(21,'03  퇴직연금 · 퇴직급여 공시 현황')
+    cellrow(22,'운영 추정',1,2,height=22,bg=grey,size=9,bold=True,color=mid)
+    cellrow(22,d['pension_type']+'  /  '+d['pension_confidence'],3,8,size=9,bold=True,color=teal)
+    cellrow(23,'공시 단서',1,2,height=22,bg=grey,size=9,bold=True,color=mid)
+    cellrow(23,f"DB {d['db_count']}건 · DC {d['dc_count']}건 · 사외적립자산 {d['asset_count']}건",3,8,size=9)
+    cellrow(24,'금융기관',1,2,height=22,bg=grey,size=9,bold=True,color=mid)
+    cellrow(24,_visit_cut(d['pension_inst'],76)+' (계약 여부 확인 필요)',3,8,size=9)
+    cellrow(25,'※ 운영·계좌·연금사업자와 공시금액의 단위/기준일은 면담 및 원문으로 재확인',height=22,size=8,color=mid,bg=orange)
+    ws.row_dimensions[26].height=8
+    section(27,'04  현장 미팅 메모 / 후속 조치  — 직접 입력하거나 인쇄 후 작성')
+    cellrow(28,'면담일시:                                  참석자 / 담당자:',height=24,size=9,color=dark,bg=light)
+    cellrow(29,'● 거래은행 / 차입 조건 확인',height=20,size=9,bold=True,color=teal)
+    for r in range(30,35):
+        cellrow(r,'',height=21,bg=white)
+        for col in range(1,9): ws.cell(r,col).border=Border(bottom=edge)
+    cellrow(35,'● 퇴직연금 현황 / 제안 포인트',height=20,size=9,bold=True,color=teal)
+    for r in range(36,41):
+        cellrow(r,'',height=21,bg=white)
+        for col in range(1,9): ws.cell(r,col).border=Border(bottom=edge)
+    cellrow(41,'● 후속 일정 / 요청자료 / 기타',height=20,size=9,bold=True,color=teal)
+    for r in range(42,48):
+        cellrow(r,'',height=21,bg=white)
+        for col in range(1,9): ws.cell(r,col).border=Border(bottom=edge)
+    cellrow(48,'DART 감사보고서 기반 미확정 분석입니다. 면담을 통해 거래은행, 실제 차입금 및 연금사업자를 확인하세요.',height=20,size=8,color=mid,bg=light)
+
+    ws.print_area='A1:H48'
+    ws.sheet_properties.pageSetUpPr.fitToPage=True
+    ws.page_setup.orientation='portrait'
+    ws.page_setup.paperSize=ws.PAPERSIZE_A4
+    ws.page_setup.fitToWidth=1
+    ws.page_setup.fitToHeight=1
+    ws.print_options.horizontalCentered=True
+    ws.page_margins=PageMargins(left=0.28,right=0.28,top=0.30,bottom=0.30,header=0.10,footer=0.10)
+    ws.oddFooter.center.text='Corporate Finder  |  Internal review only  |  &P / &N'
+    out=io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+
+def _visit_pdf_font():
+    """외부 폰트 파일을 배포하지 않고 런타임의 한국어 폰트를 선택."""
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+    opts=[
+        ('/usr/share/fonts/truetype/nanum/NanumBarunGothic.ttf','/usr/share/fonts/truetype/nanum/NanumBarunGothicBold.ttf'),
+        ('/usr/share/fonts/truetype/nanum/NanumGothic.ttf','/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf'),
+        ('C:/Windows/Fonts/malgun.ttf','C:/Windows/Fonts/malgunbd.ttf'),
+        ('C:/Windows/Fonts/gulim.ttc','C:/Windows/Fonts/gulim.ttc'),
+    ]
+    for reg,bold in opts:
+        if os.path.isfile(reg):
+            try:
+                if 'CorpVisit-Regular' not in pdfmetrics.getRegisteredFontNames():
+                    pdfmetrics.registerFont(TTFont('CorpVisit-Regular',reg))
+                    pdfmetrics.registerFont(TTFont('CorpVisit-Bold',bold if os.path.isfile(bold) else reg))
+                return 'CorpVisit-Regular','CorpVisit-Bold'
+            except Exception:
+                continue
+    # 별도 폰트 배포가 불필요한 ReportLab 내장 한글 CID 폰트
+    if 'HYGothic-Medium' not in pdfmetrics.getRegisteredFontNames():
+        pdfmetrics.registerFont(UnicodeCIDFont('HYGothic-Medium'))
+    return 'HYGothic-Medium','HYGothic-Medium'
+
+
+def make_visit_report_pdf(result, external_meta=None):
+    """A4 정확히 1페이지. 은행 근거는 요약하고 미팅 메모를 넓게 확보한다."""
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.colors import HexColor
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfbase import pdfmetrics
+    d=_visit_report_context(result,external_meta)
+    normal,bold=_visit_pdf_font()
+    w,h=A4
+    buf=io.BytesIO()
+    pdf=canvas.Canvas(buf,pagesize=A4,pageCompression=1)
+    pdf.setTitle(f"{d['name']} - 법인 현장 미팅 보고서")
+    navy=HexColor('#18354F'); teal=HexColor('#008879'); ink=HexColor('#253849')
+    mute=HexColor('#627485'); pale=HexColor('#EDF4F4'); grey=HexColor('#F2F5F7')
+    stroke=HexColor('#D8E3E7'); cream=HexColor('#FFF7E8')
+    margin=29; right=w-margin; inner_w=w-2*margin
+
+    def box(top,height,color,rad=0,x=margin,width=inner_w,border=None):
+        pdf.setFillColor(color)
+        if border:pdf.setStrokeColor(border)
+        if rad:
+            pdf.roundRect(x,h-top-height,width,height,rad,fill=1,stroke=bool(border))
+        else:
+            pdf.rect(x,h-top-height,width,height,fill=1,stroke=bool(border))
+
+    def text(x,top,value,size=9,color=ink,weight=False,maxwidth=None):
+        v=_visit_text(value,'')
+        f=bold if weight else normal
+        pdf.setFont(f,size);pdf.setFillColor(color)
+        if maxwidth:
+            while len(v)>1 and pdfmetrics.stringWidth(v,f,size)>maxwidth:
+                v=v[:-2].rstrip()+'…'
+        pdf.drawString(x,h-top-size,v)
+
+    def rule(y,x=margin+11,x2=right-11):
+        pdf.setStrokeColor(stroke);pdf.setLineWidth(0.6)
+        pdf.line(x,h-y,x2,h-y)
+
+    def section(top,idx,label):
+        text(margin,top,idx,size=10.0,color=teal,weight=True)
+        text(margin+23,top-0.4,label,size=10.2,color=navy,weight=True)
+
+    text(margin,18,'CORPORATE FINDER  /  FIELD BRIEF',size=9,color=teal,weight=True)
+    box(37,43,navy,rad=4)
+    text(margin+15,45,'법인 분석 요약 보고서',size=17,color=HexColor('#FFFFFF'),weight=True)
+    text(right-139,62,f"작성 {d['generated']}",size=8,color=HexColor('#D3E5E5'))
+    section(90,'01','기업 기본정보')
+    box(111,65,grey,rad=5)
+    text(margin+12,115,'회사명',size=8,color=mute)
+    text(margin+70,113,d['name'],size=11,color=navy,weight=True,maxwidth=inner_w-95)
+    rule(136)
+    text(margin+12,139,'대표자',size=8,color=mute)
+    text(margin+70,139,d['ceo'],size=8,maxwidth=112)
+    text(margin+218,139,'전화',size=8,color=mute)
+    text(margin+253,139,d['phone'],size=8,maxwidth=155)
+    text(margin+12,158,'주소',size=8,color=mute)
+    text(margin+70,158,d['address'],size=7.8,maxwidth=inner_w-90)
+    text(margin,179,f"사업자 {d['bizno']}   |   법인등록번호 {d['jurino']}   |   업종 {d['industry']}",size=7.6,color=mute,maxwidth=inner_w)
+    text(margin,193,f"공시: {d['report_name']}   (접수 {d['report_date']})",size=7.5,color=mute,maxwidth=inner_w)
+    section(213,'02','차입금 · 거래 금융기관')
+    box(235,120,HexColor('#FFFFFF'),rad=3,border=stroke)
+    box(235,22,navy)
+    header=[('금융기관',9),('거래유형',157),('원문 금액 표기',302),('강도',483)]
+    for label,x in header: text(margin+x,240,label,size=8,color=HexColor('#FFFFFF'),weight=True)
+    visible=d['banks'][:4]
+    for i in range(4):
+        rowtop=257+23*i
+        if i%2:box(rowtop,23,grey,x=margin+1,width=inner_w-2)
+        b=visible[i] if i<len(visible) else {}
+        text(margin+9,rowtop+6,_visit_cut(b.get('bank',''),18),size=8,maxwidth=140)
+        text(margin+157,rowtop+6,_visit_cut(b.get('type',''),19),size=7.7,maxwidth=142)
+        text(margin+302,rowtop+6,_visit_cut(b.get('amount',''),24),size=7.7,maxwidth=170)
+        text(margin+483,rowtop+6,_visit_cut(b.get('strength',''),6),size=7.7,maxwidth=42)
+    extra=max(0,len(d['banks'])-len(visible))
+    text(margin,359, ('추가 확인 금융기관 '+str(extra)+'곳: 상세분석 참조  |  ' if extra else '')+
+         '금액은 원문 추출값이며 차입금 잔액 합계로 검증되지 않음',size=7.4,color=mute,maxwidth=inner_w)
+    section(378,'03','퇴직연금 · 퇴직급여')
+    box(400,92,pale,rad=5)
+    text(margin+12,408,'운영분류',size=8,color=mute)
+    text(margin+87,406,d['pension_type'],size=10,color=teal,weight=True,maxwidth=244)
+    text(margin+347,409,d['pension_confidence'],size=7.5,color=mute,maxwidth=172)
+    rule(429)
+    text(margin+12,435,'공시 단서',size=8,color=mute)
+    text(margin+87,435,f"DB {d['db_count']}건 / DC {d['dc_count']}건 / 사외적립자산 {d['asset_count']}건",size=8,maxwidth=425)
+    text(margin+12,456,'기관 후보',size=8,color=mute)
+    text(margin+87,456,d['pension_inst'],size=8,maxwidth=410)
+    text(margin+12,476,'※ 사업자·가입 여부 및 실제 적립금은 미팅 때 확인',size=7.5,color=mute)
+    section(510,'04','현장 미팅 메모  /  후속 조치')
+    box(531,271,HexColor('#FFFFFF'),rad=4,border=stroke)
+    text(margin+12,540,'면담일시:                                 참석자 / 담당자:',size=8.5,color=mute)
+    rule(560)
+    sections=[('거래은행 · 차입조건 확인',570,3),('퇴직연금 · 기존사업자',639,3),('후속 일정 · 요청사항 · 기타',708,4)]
+    for title,top,count in sections:
+        text(margin+13,top,title,size=8.7,color=teal,weight=True)
+        for i in range(count):rule(top+21+17*i,margin+13,right-13)
+    rule(812,x=margin,x2=right)
+    text(margin,816,'DART 감사보고서 기반 요약 자료 / 거래관계·연금운영·금액은 원문 및 면담으로 검증',size=7.0,color=mute,maxwidth=inner_w)
+    pdf.showPage();pdf.save()
+    return buf.getvalue()
+
+
+def _visit_report_preview_html(d):
+    """미리보기는 PDF와 동일한 공시 내용만 간결하게 노출한다."""
+    esc=lambda v:html.escape(str(v or ''))
+    trs=''.join(
+        '<tr><td>'+esc(b['bank'])+'</td><td>'+esc(_visit_cut(b['type'],26))+'</td>'+
+        '<td>'+esc(_visit_cut(b['amount'],30))+'</td><td>'+esc(b['strength'])+'</td></tr>'
+        for b in d['banks'][:4]
+    ) or '<tr><td colspan="4">보고서에서 금융기관 근거를 확인하지 못했습니다.</td></tr>'
+    more=(f'<small>외 {len(d["banks"])-4}개 금융기관: 상세 분석 참조</small>' if len(d['banks'])>4 else '')
+    return f"""<!doctype html><html lang="ko"><meta charset="utf-8"><style>
+    *{{box-sizing:border-box}}body{{margin:0;padding:14px;background:#eaf0f1;font-family:"Malgun Gothic","Noto Sans KR",sans-serif;color:#253849}}
+    article{{max-width:710px;margin:auto;background:white;min-height:870px;padding:26px;box-shadow:0 2px 12px #82909830}}
+    header{{background:#18354f;color:white;padding:18px 20px;border-radius:6px}}header strong{{font-size:23px}}header div{{font-size:12px;margin-top:5px;opacity:.87}}
+    h3{{font-size:14px;margin:18px 0 7px;color:#008879}}.basics{{display:grid;grid-template-columns:1fr 1fr;gap:5px 13px;background:#f2f5f7;border-radius:5px;padding:12px;font-size:11px}}
+    .wide{{grid-column:span 2}}table{{border-collapse:collapse;width:100%;font-size:11px}}th{{background:#18354f;color:white}}td,th{{text-align:left;padding:9px;border-bottom:1px solid #d8e3e7}}tr:nth-child(even){{background:#f2f5f7}}
+    .pension{{background:#edf4f4;padding:12px;font-size:11px;line-height:1.8;border-radius:5px}}
+    .memo{{height:265px;border:1px solid #d8e3e7;border-radius:5px;padding:10px 14px}}.memo b{{display:block;color:#008879;margin:8px 0}}.lines{{height:45px;background:repeating-linear-gradient(to bottom,transparent 0px,transparent 19px,#d8e3e7 20px,#d8e3e7 21px)}}
+    footer{{font-size:10px;color:#627485;margin-top:11px}}
+    </style><body><article><header><strong>법인 분석 요약 보고서</strong><div>{esc(d['name'])} · {esc(d['generated'])}</div></header>
+    <h3>01 기업 기본정보</h3><div class="basics"><div>대표자 : {esc(d['ceo'])}</div><div>전화번호 : {esc(d['phone'])}</div>
+    <div>사업자번호 : {esc(d['bizno'])}</div><div>법인등록번호 : {esc(d['jurino'])}</div>
+    <div class="wide">본점 주소 : {esc(d['address'])}</div><div class="wide">감사보고서 : {esc(d['report_name'])} / {esc(d['report_date'])}</div></div>
+    <h3>02 차입금 · 거래 금융기관</h3><table><tr><th>금융기관</th><th>거래유형</th><th>금액 표기(미검증)</th><th>강도</th></tr>{trs}</table>{more}
+    <h3>03 퇴직연금 · 퇴직급여</h3><div class="pension"><b>{esc(d['pension_type'])}</b> ({esc(d['pension_confidence'])})<div>DB {d['db_count']}건 · DC {d['dc_count']}건 · 사외적립자산 {d['asset_count']}건</div><div>연금 금융기관 후보: {esc(d['pension_inst'])}</div><div>※ 실제 사업자·계약 및 적립금은 회사 확인 필요</div></div>
+    <h3>04 현장 미팅 메모 / 후속 조치</h3><div class="memo"><b>거래은행 · 차입조건</b><div class="lines"></div><b>퇴직연금 · 기존사업자</b><div class="lines"></div><b>후속 일정 · 요청사항 · 기타</b><div class="lines"></div></div>
+    <footer>공시 기반의 내부 검토자료이며 실제 거래은행·차입금 잔액·퇴직연금 사업자를 확정하지 않습니다.</footer></article></body></html>"""
+
+
+def render_visit_report_exports(result, widget_key, external_meta=None):
+    """법인명·지역 검색 공통. 기존 상세 엑셀은 호출부에서 별도로 유지."""
+    d=_visit_report_context(result,external_meta)
+    st.markdown('### 📄 A4 현장 미팅용 법인 분석 보고서')
+    st.caption('기업 기본정보 · 금융기관/차입 관련 공시 · 퇴직연금 현황 / 하단은 현장 메모 공간. 인쇄는 A4 세로 1장입니다.')
+    with st.expander('👁️ A4 보고서 미리보기',expanded=False):
+        import streamlit.components.v1 as components
+        components.html(_visit_report_preview_html(d),height=940,scrolling=True)
+    ca,cb=st.columns(2)
+    with ca:
+        try:
+            pdf_bytes=make_visit_report_pdf(result,external_meta)
+            st.download_button('📄 A4 보고서 PDF 다운로드', data=pdf_bytes,
+                               file_name=f"{_visit_filename(d['name'])}_현장미팅보고서.pdf",
+                               mime='application/pdf',key=widget_key+'_pdf',use_container_width=True)
+        except ImportError:
+            st.warning('PDF 생성에는 reportlab이 필요합니다. requirements.txt에 reportlab>=4.2를 추가해 주세요.')
+        except Exception as exc:
+            st.warning(f'PDF 생성 실패: {type(exc).__name__} (기존 분석은 유지됩니다)')
+    with cb:
+        try:
+            excel_bytes=make_visit_report_excel(result,external_meta)
+            st.download_button('📊 A4 편집용 엑셀 다운로드',data=excel_bytes,
+                               file_name=f"{_visit_filename(d['name'])}_현장미팅보고서.xlsx",
+                               mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                               key=widget_key+'_a4excel',use_container_width=True)
+        except Exception as exc:
+            st.warning(f'A4 엑셀 생성 실패: {type(exc).__name__} (기존 상세 엑셀은 유지됩니다)')
+    st.caption('※ 금융기관·금액·퇴직연금 정보는 감사보고서 추출 단서입니다. 확정 거래/잔액/연금사업자 정보로 사용하지 마세요.')
+
+
 # =========================================================
 # LOGIN — MATCHES HANAV ETF FINDER
 # =========================================================
@@ -2186,9 +2562,11 @@ with name_tab:
                 for txt in generic[:10]:
                     st.write("• " + txt)
 
+        render_visit_report_exports(result, 'single_visit')
+
         excel = make_excel([result])
         st.download_button(
-            "📥 분석 결과 엑셀 다운로드",
+            "📥 기존 상세 분석 엑셀 다운로드",
             data=excel,
             file_name=f"{c['법인명']}_법인Finder.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -2466,8 +2844,10 @@ with region_tab:
                     for txt in generic[:10]:
                         st.write("• " + txt)
 
+            render_visit_report_exports(rr, 'region_visit', external_meta=picked)
+
             st.download_button(
-                "📥 선택 회사 분석 엑셀",
+                "📥 기존 상세 분석 엑셀",
                 data=make_excel([rr]),
                 file_name=f"{c['법인명']}_법인Finder.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
