@@ -7,6 +7,7 @@ import tempfile
 import html
 import re
 import ssl
+import socket
 import time
 import sqlite3
 import zipfile
@@ -170,37 +171,38 @@ def render_bank_analysis(banks, title="🏦 감사보고서에서 확인된 거�
 
 
 # =========================================================
-# OpenDART HTTPS 연결 설정 (로컬 + Streamlit Cloud 호환)
+# OpenDART HTTPS 연결 (국문 -> 공식 영문 경로, 장애 시 단기 차단)
 # =========================================================
-# Streamlit Cloud/Linux에서는 기본 TLS 연결이 정상인 경우가 많고,
-# 일부 Windows/Python 3.13 환경에서만 DH_KEY_TOO_SMALL 오류가 발생할 수 있습니다.
-# 따라서 기본 TLS를 먼저 사용하고, 해당 SSL 오류일 때만 호환 모드로 재시도합니다.
+# 접속 제한 3~4초가 정상적인 느린 연결도 실패 처리하던 문제를 개선한다.
+# 두 서버 모두 접속 불가능할 경우 같은 세션에서 반복 접속을 잠시 방지한다.
+# DART 측 IP/네트워크 차단은 애플리케이션만 수정해서 해제할 수 없다.
+_DART_CONNECT_TIMEOUT = 8
+_DART_DIAG_CONNECT_TIMEOUT = 5
+_DART_NETWORK_COOLDOWN = 90
+
 
 class DARTSSLAdapter(HTTPAdapter):
     def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        # 레거시 DH_KEY_TOO_SMALL을 겪는 PC에 한해 사용하는 호환 어댑터.
         ctx = ssl.create_default_context()
         ctx.set_ciphers("DEFAULT:@SECLEVEL=1")
         pool_kwargs["ssl_context"] = ctx
         self.poolmanager = PoolManager(
-            num_pools=connections,
-            maxsize=maxsize,
-            block=block,
-            **pool_kwargs,
+            num_pools=connections, maxsize=maxsize, block=block, **pool_kwargs
         )
 
 
 def _retry_policy():
-    # 접속 차단 시 30초 x 4회 지연되는 현상 방지. 서버 재시도는 사용자가 명시적으로 다시 시도.
+    # 수동으로 국문/영문 우회를 관리하므로 requests의 숨은 재시도는 사용하지 않는다.
     return Retry(total=0, connect=0, read=0, redirect=0, backoff_factor=0)
 
 
 @st.cache_resource
 def get_dart_default_session():
     session = requests.Session()
-    adapter = HTTPAdapter(max_retries=_retry_policy())
-    session.mount("https://", adapter)
+    session.mount("https://", HTTPAdapter(max_retries=_retry_policy()))
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 Corporate-Finder/2.8",
+        "User-Agent": "Mozilla/5.0 Corporate-Finder/2.9",
         "Accept": "*/*",
         "Connection": "keep-alive",
     })
@@ -209,25 +211,18 @@ def get_dart_default_session():
 
 @st.cache_resource
 def get_dart_primary_session():
-    """국문 DART 1차 연결용: Cloud에서 막혀 있을 때 오래 대기하지 않도록 재시도하지 않음."""
-    session = requests.Session()
-    adapter = HTTPAdapter(max_retries=Retry(total=0, connect=0, read=0, redirect=0))
-    session.mount("https://", adapter)
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 Corporate-Finder/2.8",
-        "Accept": "*/*",
-        "Connection": "keep-alive",
-    })
-    return session
+    return get_dart_default_session()
 
 
 @st.cache_resource
 def get_dart_legacy_session():
     session = requests.Session()
-    adapter = DARTSSLAdapter(max_retries=_retry_policy())
-    session.mount("https://opendart.fss.or.kr/", adapter)
+    session.mount(
+        "https://opendart.fss.or.kr/",
+        DARTSSLAdapter(max_retries=_retry_policy()),
+    )
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 Corporate-Finder/2.8",
+        "User-Agent": "Mozilla/5.0 Corporate-Finder/2.9",
         "Accept": "*/*",
         "Connection": "keep-alive",
     })
@@ -236,26 +231,29 @@ def get_dart_legacy_session():
 
 def _to_eng_dart_url(url: str) -> str:
     """국문 OpenDART API URL을 공식 영문 OpenDART API URL로 변환."""
-    if not isinstance(url, str):
-        return url
-    if url.startswith("https://opendart.fss.or.kr/api/"):
+    if isinstance(url, str) and url.startswith("https://opendart.fss.or.kr/api/"):
         return url.replace(
             "https://opendart.fss.or.kr/api/",
-            "https://engopendart.fss.or.kr/engapi/",
-            1,
+            "https://engopendart.fss.or.kr/engapi/", 1,
         )
     return url
 
 
 def _dart_safe_error(exc: Exception) -> str:
-    """API 키가 포함된 원본 요청 URL/예외 메시지를 UI로 내보내지 않는다."""
+    """인증키/요청 URL/내부 예외의 민감한 텍스트는 절대 노출하지 않는다."""
     if isinstance(exc, requests.exceptions.ConnectTimeout):
         return "연결 시간 초과"
     if isinstance(exc, requests.exceptions.ReadTimeout):
         return "서버 응답 시간 초과"
     if isinstance(exc, requests.exceptions.SSLError):
-        return "SSL 보안 연결 실패"
+        return "TLS/SSL 인증 또는 협상 실패"
+    if isinstance(exc, requests.exceptions.ProxyError):
+        return "중간 프록시 연결 실패"
     if isinstance(exc, requests.exceptions.ConnectionError):
+        # requests가 ConnectionError 안에 DNSError 등을 감싸는 경우가 있음.
+        detail = str(exc).lower()
+        if any(token in detail for token in ("nameresolutionerror", "name or service not known", "temporary failure in name resolution")):
+            return "DNS 이름 조회 실패"
         return "네트워크 연결 실패"
     if isinstance(exc, requests.exceptions.HTTPError):
         response = getattr(exc, "response", None)
@@ -266,77 +264,181 @@ def _dart_safe_error(exc: Exception) -> str:
 
 
 def _check_dart_http(response):
-    """raise_for_status 예외가 인증키 포함 URL을 노출하지 않도록 한다."""
     if not (200 <= response.status_code < 300):
         raise RuntimeError(f"DART HTTP 응답 오류 ({response.status_code})")
 
 
+def _dart_cooldown_remaining():
+    """실패한 서버에 매 화면 렌더링마다 재접속하는 현상 방지."""
+    return max(0, int(float(st.session_state.get("_dart_cooldown_until", 0)) - time.monotonic()))
+
+
+def _dart_reset_cooldown():
+    st.session_state.pop("_dart_cooldown_until", None)
+    st.session_state.pop("_dart_last_network_error", None)
+
+
+def _dart_mark_network_failure(message):
+    st.session_state["_dart_cooldown_until"] = time.monotonic() + _DART_NETWORK_COOLDOWN
+    st.session_state["_dart_last_network_error"] = message
+
+
 def dart_get(url, **kwargs):
-    """국문 우선, 연결 실패 시 공식 영문 API 1회 우회. 네트워크 오류는 키 없이 표시."""
+    """국문 API 요청; 접속 실패 시 영문 API로 우회. 무의미한 반복 대기 방지."""
+    remaining = _dart_cooldown_remaining()
+    if remaining:
+        raise RuntimeError(
+            f"DART 국문·영문 연결 실패 후 재접속 대기 중({remaining}초). "
+            "'DART 연결 진단'으로 즉시 다시 확인할 수 있습니다."
+        )
+
     original_timeout = kwargs.get("timeout", 30)
     if isinstance(original_timeout, (tuple, list)):
-        read_timeout = original_timeout[1]
+        read_timeout = float(original_timeout[1])
     else:
-        read_timeout = original_timeout
-    # 연결 제한만 4초, 보고서 원문 다운로드의 읽기 제한은 기존 최대 90초 유지.
-    short_kwargs = dict(kwargs)
-    short_kwargs["timeout"] = (4, read_timeout)
+        read_timeout = float(original_timeout)
+    request_kwargs = dict(kwargs)
+    request_kwargs["timeout"] = (_DART_CONNECT_TIMEOUT, read_timeout)
+
+    primary_error = None
     try:
-        return get_dart_primary_session().get(url, **short_kwargs)
+        response = get_dart_primary_session().get(url, **request_kwargs)
+        if response.status_code < 500:
+            _dart_reset_cooldown()
+            return response
+        primary_error = f"HTTP {response.status_code}"
     except requests.exceptions.SSLError as exc:
-        # 일부 로컬 Windows의 DH_KEY_TOO_SMALL 오류에만 약한 SSL 호환 모드 적용.
         if "DH_KEY_TOO_SMALL" in str(exc).upper() or "DH KEY TOO SMALL" in str(exc).upper():
             try:
-                return get_dart_legacy_session().get(url, **short_kwargs)
-            except requests.exceptions.RequestException:
-                pass
+                response = get_dart_legacy_session().get(url, **request_kwargs)
+                if response.status_code < 500:
+                    _dart_reset_cooldown()
+                    return response
+                primary_error = f"HTTP {response.status_code}"
+            except requests.exceptions.RequestException as retry_exc:
+                primary_error = _dart_safe_error(retry_exc)
         else:
-            raise RuntimeError("DART 국문 서버 SSL 연결 실패") from None
-    except (requests.exceptions.ConnectTimeout, requests.exceptions.ConnectionError,
-            requests.exceptions.ReadTimeout):
-        pass
+            primary_error = _dart_safe_error(exc)
     except requests.exceptions.RequestException as exc:
-        raise RuntimeError(f"DART 국문 서버 요청 실패: {_dart_safe_error(exc)}") from None
+        primary_error = _dart_safe_error(exc)
 
     alt = _to_eng_dart_url(url)
     if alt == url:
-        raise RuntimeError("DART 국문 서버에 연결되지 않았습니다.")
+        _dart_mark_network_failure(primary_error or "국문 서버 접속 실패")
+        raise RuntimeError("DART 국문 서버 연결 실패: " + (primary_error or "알 수 없는 오류"))
+
+    secondary_error = None
     try:
-        # 영문 도메인도 1회만 접속한다. 기존 3회 재시도 제거.
-        return get_dart_default_session().get(alt, **short_kwargs)
+        response = get_dart_default_session().get(alt, **request_kwargs)
+        if response.status_code < 500:
+            _dart_reset_cooldown()
+            return response
+        secondary_error = f"HTTP {response.status_code}"
     except requests.exceptions.RequestException as exc:
-        raise RuntimeError(
-            "DART 국문·영문 서버 연결 실패: " + _dart_safe_error(exc)
-            + ". Streamlit Cloud ↔ DART 연결 상태를 점검해 주세요."
-        ) from None
+        secondary_error = _dart_safe_error(exc)
+
+    error_message = (
+        f"국문: {primary_error or '접속 실패'} / "
+        f"영문: {secondary_error or '접속 실패'}"
+    )
+    _dart_mark_network_failure(error_message)
+    raise RuntimeError(
+        f"DART 국문·영문 서버 연결 실패 ({error_message}). "
+        "네트워크·IP 제한 또는 서버 응답 지연 여부를 연결 진단에서 확인해 주세요."
+    )
 
 
 def check_dart_connection(api_key: str, corp_code: str):
-    """국문/영문 공시목록 API를 독립적으로 테스트한다(인증키 비노출)."""
-    endpoints = [("국문", f"{DART_BASE}/list.json"),
-                 ("영문", f"{DART_ENG_BASE}/list.json")]
-    checks = []
-    params = {"crtfc_key": api_key, "corp_code": corp_code,
-              "bgn_de": (date.today() - timedelta(days=365)).strftime("%Y%m%d"),
-              "end_de": date.today().strftime("%Y%m%d"),
-              "page_count": 1}
-    for label, endpoint in endpoints:
-        started = time.perf_counter()
+    """DNS/TCP/TLS/API를 나누어 테스트한다. 인증키/실제 요청 URL은 표시하지 않는다.
+
+    TCP 테스트는 직접 연결이며, HTTP 테스트는 requests의 시스템 프록시 설정을 이용할 수 있다.
+    단계별 실패가 반드시 DART의 장애를 뜻하지는 않는다.
+    """
+    endpoints = [
+        ("국문", "opendart.fss.or.kr", f"{DART_BASE}/list.json"),
+        ("영문", "engopendart.fss.or.kr", f"{DART_ENG_BASE}/list.json"),
+    ]
+    results = []
+    params = {
+        "crtfc_key": api_key,
+        "corp_code": corp_code,
+        "bgn_de": (date.today() - timedelta(days=365)).strftime("%Y%m%d"),
+        "end_de": date.today().strftime("%Y%m%d"),
+        "page_count": 1,
+    }
+    for label, host, endpoint in endpoints:
+        began = time.perf_counter()
         try:
-            r = get_dart_primary_session().get(endpoint, params=params, timeout=(3, 5))
-            status = f"HTTP {r.status_code}"
+            socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+            dns_ok = True
+            dns_state = "정상"
+        except (OSError, ValueError):
+            dns_ok = False
+            dns_state = "이름 조회 실패"
+        results.append({"서버": label, "단계": "DNS", "결과": dns_state,
+                        "소요시간(초)": round(time.perf_counter() - began, 1)})
+
+        raw_sock = None
+        began = time.perf_counter()
+        tcp_ok = False
+        if dns_ok:
+            try:
+                raw_sock = socket.create_connection((host, 443), timeout=_DART_DIAG_CONNECT_TIMEOUT)
+                tcp_ok = True
+                tcp_state = "정상"
+            except (OSError, ValueError):
+                tcp_state = "접속 실패/시간 초과"
+        else:
+            tcp_state = "DNS 실패로 생략"
+        results.append({"서버": label, "단계": "TCP 443", "결과": tcp_state,
+                        "소요시간(초)": round(time.perf_counter() - began, 1)})
+
+        began = time.perf_counter()
+        if tcp_ok:
+            try:
+                with ssl.create_default_context().wrap_socket(raw_sock, server_hostname=host) as tls_sock:
+                    tls_sock.settimeout(_DART_DIAG_CONNECT_TIMEOUT)
+                    tls_state = "정상"
+            except (ssl.SSLError, OSError, ValueError):
+                tls_state = "TLS 협상 실패"
+            finally:
+                if raw_sock:
+                    raw_sock.close()
+        else:
+            tls_state = "TCP 실패로 생략"
+        results.append({"서버": label, "단계": "TLS", "결과": tls_state,
+                        "소요시간(초)": round(time.perf_counter() - began, 1)})
+
+        began = time.perf_counter()
+        try:
+            r = get_dart_default_session().get(
+                endpoint, params=params, timeout=(_DART_DIAG_CONNECT_TIMEOUT, 12)
+            )
             if r.ok:
+                # 실제 HTTP 응답이 있으면 네트워크 자체는 도달 가능한 상태.
+                # DART 012(IP 제한) 등은 다음 요청에서 구체적인 원인으로 표시한다.
+                _dart_reset_cooldown()
                 try:
                     data = r.json()
-                    status += f" / DART {data.get('status', '응답 확인')}"
+                    code = str(data.get("status", "미확인"))
+                    state = f"HTTP {r.status_code} / DART {code}"
+                    if code in ("000", "013"):
+                        _dart_reset_cooldown()
+                    elif code == "012":
+                        state += " (접속 IP 제한)"
+                    elif code == "020":
+                        state += " (요청 한도)"
+                    elif code in ("010", "011", "901"):
+                        state += " (인증키 상태 확인)"
                 except (ValueError, AttributeError):
-                    status += " / JSON 해석 불가"
-            checks.append({"접속경로": label, "결과": status,
-                           "소요시간(초)": round(time.perf_counter()-started, 1)})
+                    state = f"HTTP {r.status_code} / JSON 해석 불가"
+            else:
+                state = f"HTTP {r.status_code}"
         except requests.exceptions.RequestException as exc:
-            checks.append({"접속경로": label, "결과": _dart_safe_error(exc),
-                           "소요시간(초)": round(time.perf_counter()-started, 1)})
-    return checks
+            state = _dart_safe_error(exc)
+        results.append({"서버": label, "단계": "공시목록 API", "결과": state,
+                        "소요시간(초)": round(time.perf_counter() - began, 1)})
+    return results
 
 
 BANK_PATTERNS = {
@@ -1857,29 +1959,44 @@ def _analyze_company_online(api_key: str, corp_row: dict):
 
 
 def analyze_company(api_key: str, corp_row: dict, *, refresh=False):
-    """기존 분석은 즉시 표시. 사용자가 명시적으로 요청해야 DART로 최신 갱신한다."""
+    """저장 결과 우선. 사용자 재분석은 새로 요청하되 장애 시 양호한 기존 결과 보호."""
     code = str(corp_row.get("corp_code", ""))
     cached, analyzed_at = get_saved_company_analysis(code)
+    usable_cache = bool(cached and cached.get("report") and not cached.get("error"))
+
     if not dart_enabled:
         if cached is None:
             raise RuntimeError("저장된 분석 결과가 없습니다. DART 접속 가능할 때 해당 법인을 먼저 분석해 주세요.")
         st.info(f"오프라인: {analyzed_at} 저장 결과 표시 (최신 공시 미반영)")
         return cached
-    # 오류/미발견 결과만 있는 저장본은 자동 재조회해 재분석 기회를 보장한다.
-    usable_cache = bool(cached and cached.get("report") and not cached.get("error"))
+
     if usable_cache and not refresh:
         st.info(f"💾 {analyzed_at} 저장 분석 결과를 즉시 표시합니다. 최신 공시는 '최신 공시 재분석'을 눌러 주세요.")
         return cached
+
     try:
         if refresh:
-            # 최신 공시 재분석에서는 30분짜리 공시목록 캐시를 해당 법인에 한해 무효화.
+            # 사용자 명시적 재분석은 장애 이후의 90초 재접속 제한을 해제한다.
+            _dart_reset_cooldown()
             get_disclosures.clear(api_key, code)
         result = _analyze_company_online(api_key, corp_row)
+        # 잠시 공시 결과가 누락되었거나 영어 경로에서 예상 못한 응답을 받아도
+        # 정상적으로 분석된 기존 거래은행/퇴직연금 저장본을 덮어쓰지 않는다.
+        if usable_cache and (not result.get("report") or result.get("error")):
+            st.warning(
+                f"최근 공시에서 유효한 감사보고서를 확인하지 못해 "
+                f"{analyzed_at}에 저장한 기존 정상 결과를 유지합니다."
+            )
+            return cached
         save_company_analysis(result)
         return result
-    except Exception:
+    except Exception as exc:
         if cached is not None:
-            st.warning(f"DART 최신 조회에 실패해 {analyzed_at} 저장 분석 결과를 표시합니다. 연결 진단을 확인해 주세요.")
+            reason = str(exc) if isinstance(exc, RuntimeError) else _dart_safe_error(exc)
+            st.warning(
+                f"DART 최신 조회 실패 ({reason}). "
+                f"{analyzed_at}에 저장한 결과를 표시합니다. 최신 공시가 아닐 수 있습니다."
+            )
             return cached
         raise
 
@@ -2790,6 +2907,10 @@ with region_tab:
                 labels = [company_label(x) for x in candidate_rows]
                 sel_label = st.selectbox("DART 법인 매칭", labels, key="region_dart_match_select")
                 selected_corp = candidate_rows[labels.index(sel_label)]
+                _selected_code = str(selected_corp.get("corp_code", ""))
+                if st.session_state.get("_last_region_dart_code") != _selected_code:
+                    st.session_state.pop("region_analysis_result", None)
+                    st.session_state["_last_region_dart_code"] = _selected_code
 
                 st.info("이 회사를 선택하면 감사보고서에서 거래은행·금융거래 근거와 퇴직연금 관련 공시를 함께 분석합니다.")
                 _rg_c1, _rg_c2, _rg_c3 = st.columns([2.2, 1.2, 1.1])
@@ -2810,7 +2931,24 @@ with region_tab:
                     with st.spinner("DART 국문·영문 공시목록 연결을 각각 확인 중입니다..."):
                         _rg_checks = check_dart_connection(api_key, selected_corp["corp_code"])
                     st.dataframe(pd.DataFrame(_rg_checks), hide_index=True, use_container_width=True)
-                    st.caption("HTTP 200 / DART 000은 조회 성공, DART 013은 공시자료 없음입니다. 접속 실패면 서버/네트워크 문제입니다.")
+                    st.caption(
+                        "DNS=서버 주소 검색, TCP 443=네트워크 접속, TLS=HTTPS 보안 협상, "
+                        "공시목록 API=실제 DART 응답입니다. DART 000=조회 성공, 013=자료 없음, "
+                        "012=접속 IP 제한, 020=요청 한도 초과. "
+                        "TCP/TLS는 직접 연결 테스트이므로 네트워크 프록시를 사용하는 환경에서는 "
+                        "API 결과와 달라질 수 있습니다."
+                    )
+                    _rg_ok = any(
+                        item["단계"] == "공시목록 API" and (
+                            "DART 000" in item["결과"] or "DART 013" in item["결과"]
+                        ) for item in _rg_checks
+                    )
+                    if not _rg_ok:
+                        st.warning(
+                            "DART 실제 API 연결이 확인되지 않습니다. 두 서버 모두 TCP 단계에서 실패한다면 "
+                            "Streamlit Cloud의 외부 연결 제한이나 DART 측 접속 IP 정책을 점검해야 합니다. "
+                            "기존 Supabase 저장 분석은 계속 조회할 수 있습니다."
+                        )
 
         rr = st.session_state.get("region_analysis_result")
         if rr:
