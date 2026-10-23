@@ -881,6 +881,12 @@ def _db_cloud_push(show_feedback=False):
     if cfg is None:
         return False
     try:
+        # 다른 PC/Cloud 세션에서 올린 기존 분석 결과가 뒤늦은 전체 DB 업로드로
+        # 사라지는 일을 줄인다. 네트워크 불가 때에는 로컬 백업 기능을 유지한다.
+        try:
+            _db_cloud_merge_analysis_from_remote()
+        except Exception:
+            pass
         raw = _db_sqlite_snapshot()
         headers = dict(cfg['headers'])
         headers.update({'Content-Type': 'application/x-sqlite3',
@@ -898,6 +904,96 @@ def _db_cloud_push(show_feedback=False):
         if show_feedback:
             st.error(f'클라우드 DB 백업 실패. 현재 서버의 DB는 유지됩니다: {exc}')
         return False
+
+
+def _db_cloud_merge_analysis_from_remote(only_corp: str | None = None) -> int:
+    """Supabase 전체 DB 중 *분석 결과*만 현재 DB에 안전하게 병합한다.
+
+    서버 실행시 1회 복원과 달리 실행 중에도 PC가 올린 최신 분석을 가져온다.
+    기존 로컬 분석은 더 최신이거나 같으면 그대로 둔다. DB 전체를 덮어쓰지 않는다.
+    서버의 다른 작업에 영향을 주지 않도록 쓰기/되올리기는 하지 않는다.
+    """
+    cfg = _db_cloud_config()
+    if cfg is None:
+        raise RuntimeError('Supabase 비공개 DB 연결 설정이 없습니다.')
+    if only_corp is not None and not re.fullmatch(r"[0-9]{8}", str(only_corp)):
+        raise ValueError('DART 법인 고유번호는 8자리 숫자여야 합니다.')
+
+    response = requests.get(cfg['read_url'], headers=cfg['headers'], timeout=(10, 120))
+    if response.status_code == 404:
+        raise RuntimeError('Supabase에 저장된 SQLite 백업이 없습니다.')
+    response.raise_for_status()
+    raw = response.content
+    _db_valid_snapshot(raw)
+
+    with _db_tempfile.NamedTemporaryFile(suffix='.sqlite3', delete=False) as f:
+        f.write(raw)
+        tmp = Path(f.name)
+    imported = 0
+    try:
+        with sqlite3.connect(str(tmp)) as remote:
+            remote.row_factory = sqlite3.Row
+            if not remote.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='company_analysis'"
+            ).fetchone():
+                return 0
+            if only_corp is not None:
+                rows = remote.execute(
+                    'SELECT corp_code, result_json, analyzed_at FROM company_analysis WHERE corp_code=?',
+                    (str(only_corp),),
+                ).fetchall()
+            else:
+                rows = remote.execute(
+                    'SELECT corp_code, result_json, analyzed_at FROM company_analysis'
+                ).fetchall()
+            profiles_exist = bool(remote.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='company_profile'"
+            ).fetchone())
+
+            with get_db_connection() as local:
+                for row in rows:
+                    code = str(row['corp_code'])
+                    # 원본 백업 중 비정상 JSON은 무시하고 다른 정상 결과를 계속 병합
+                    try:
+                        parsed = json.loads(row['result_json'])
+                        if not isinstance(parsed, dict) or not parsed.get('company'):
+                            continue
+                    except (ValueError, TypeError):
+                        continue
+                    old = local.execute(
+                        'SELECT analyzed_at FROM company_analysis WHERE corp_code=?', (code,)
+                    ).fetchone()
+                    if old and str(old['analyzed_at'] or '') >= str(row['analyzed_at'] or ''):
+                        continue
+                    local.execute(
+                        'INSERT INTO company_analysis(corp_code, result_json, analyzed_at) '
+                        'VALUES(?,?,?) ON CONFLICT(corp_code) DO UPDATE SET '
+                        'result_json=excluded.result_json, analyzed_at=excluded.analyzed_at',
+                        (code, row['result_json'], row['analyzed_at']),
+                    )
+                    imported += 1
+                    if profiles_exist:
+                        profile = remote.execute(
+                            'SELECT * FROM company_profile WHERE corp_code=?', (code,)
+                        ).fetchone()
+                        if profile is not None:
+                            old_profile = local.execute(
+                                'SELECT fetched_at FROM company_profile WHERE corp_code=?', (code,)
+                            ).fetchone()
+                            if not old_profile or str(old_profile['fetched_at'] or '') < str(profile['fetched_at'] or ''):
+                                # 프로필의 구형/신형 DB 간 열 차이를 자동으로 처리
+                                local_cols = {x[1] for x in local.execute('PRAGMA table_info(company_profile)')}
+                                cols = [key for key in profile.keys() if key in local_cols]
+                                placeholders = ','.join('?' for _ in cols)
+                                column_list = ','.join('"'+col+'"' for col in cols)
+                                values = [profile[key] for key in cols]
+                                local.execute(
+                                    f'INSERT OR REPLACE INTO company_profile({column_list}) VALUES({placeholders})',
+                                    values,
+                                )
+        return imported
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _db_cloud_restore_on_boot():
@@ -956,11 +1052,25 @@ def _db_cloud_indicator():
         if st.session_state.get('_db_cloud_error'):
             st.warning('☁️ 최근 동기화 오류: ' + st.session_state['_db_cloud_error'])
         else:
-            st.caption('☁️ 비공개 클라우드 DB 연결됨 · 서버 재시작 시 마지막 저장본 자동 복원')
+            st.caption('☁️ 비공개 클라우드 DB 연결됨 · 서버 시작 시 자동 복원 · 수동으로 PC 분석 결과 새로고침 가능')
         if st.session_state.get('_db_cloud_saved_at'):
             st.caption('마지막 클라우드 백업: ' + st.session_state['_db_cloud_saved_at'])
-        if st.button('☁️ 현재 DB 영구 저장', key='corp' + '_cloud_save_btn'):
-            _db_cloud_push(show_feedback=True)
+        sync_left, sync_right = st.columns(2)
+        with sync_left:
+            if st.button('☁️ 현재 DB 영구 저장', key='corp_cloud_save_btn'):
+                _db_cloud_push(show_feedback=True)
+        with sync_right:
+            if st.button('📥 PC 최신 분석 결과 가져오기', key='corp_cloud_pull_analysis_btn'):
+                try:
+                    with st.spinner('Supabase DB에서 PC가 분석한 결과를 확인하고 병합하는 중입니다...'):
+                        count = _db_cloud_merge_analysis_from_remote()
+                    if count:
+                        st.success(f'새로운/갱신된 분석 결과 {count:,}건을 가져왔습니다.')
+                        st.rerun()
+                    else:
+                        st.info('가져올 신규 분석 결과가 없습니다. PC에서 정상 분석 후 Supabase 저장 여부를 확인해 주세요.')
+                except Exception as exc:
+                    st.error(f'최신 분석 결과 가져오기 실패: {_dart_safe_error(exc) if isinstance(exc, requests.exceptions.RequestException) else exc}')
 
 
 def sync_corp_master(corp_df: pd.DataFrame):
@@ -1962,6 +2072,14 @@ def analyze_company(api_key: str, corp_row: dict, *, refresh=False):
     """저장 결과 우선. 사용자 재분석은 새로 요청하되 장애 시 양호한 기존 결과 보호."""
     code = str(corp_row.get("corp_code", ""))
     cached, analyzed_at = get_saved_company_analysis(code)
+    if cached is None:
+        # 앱을 다시 시작하지 않아도 PC가 Supabase에 올린 최신 분석을 바로 활용.
+        # Supabase가 느리거나 실패하면 기존 로컬 캐시 / 직접 DART 조회로 진행한다.
+        try:
+            _db_cloud_merge_analysis_from_remote(only_corp=code)
+            cached, analyzed_at = get_saved_company_analysis(code)
+        except Exception:
+            pass
     usable_cache = bool(cached and cached.get("report") and not cached.get("error"))
 
     if not dart_enabled:
@@ -2580,7 +2698,7 @@ if st.button("🔄 DART 법인목록 최신 업데이트", disabled=not dart_ena
         st.error(f"업데이트에 실패했습니다. 기존 저장 DB를 유지합니다: {exc}")
 
 if not dart_enabled:
-    st.info("저장된 법인·주소·전화번호를 검색할 수 있습니다. 거래은행·퇴직연금은 이전에 분석·저장한 법인에 한해 조회할 수 있습니다.")
+    st.info("저장된 법인·주소·전화번호를 검색할 수 있습니다. 거래은행·퇴직연금은 저장된 분석이 있는 법인에 한해 조회 가능합니다. PC에서 새로 분석했다면 상단 'PC 최신 분석 결과 가져오기'를 누르세요.")
 
 
 # =========================================================
