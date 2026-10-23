@@ -627,9 +627,25 @@ EXTERNAL_COL_CANDIDATES = {
 }
 
 
+class _AutoClosingSQLiteConnection(sqlite3.Connection):
+    """sqlite3.Connection.__exit__ commits/rolls back but does NOT close.
+
+    In Windows leaving these handles open prevents deleting temporary SQLite
+    snapshots (WinError 32) and can keep the live database locked as well.
+    """
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 def get_db_connection():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(
+        DB_PATH, check_same_thread=False, factory=_AutoClosingSQLiteConnection
+    )
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -805,6 +821,7 @@ def restore_full_db_bytes(raw: bytes):
 # =========================================================
 import hashlib as _db_hashlib
 import tempfile as _db_tempfile
+from contextlib import closing as _db_closing
 from urllib.parse import quote as _db_quote
 
 _DB_CLOUD_OBJECT = 'corporate/corp_finder_cache.sqlite3'
@@ -836,7 +853,7 @@ def _db_valid_snapshot(raw):
         f.write(raw)
         tmp = Path(f.name)
     try:
-        with sqlite3.connect(str(tmp)) as conn:
+        with _db_closing(sqlite3.connect(str(tmp))) as conn:
             if conn.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
                 raise ValueError('DB 무결성 검사에 실패했습니다.')
             tables = {x[0] for x in conn.execute(
@@ -856,8 +873,10 @@ def _db_sqlite_snapshot():
     with _db_tempfile.NamedTemporaryFile(suffix='.sqlite3', delete=False) as f:
         tmp = Path(f.name)
     try:
-        with sqlite3.connect(str(path), timeout=30) as src, sqlite3.connect(str(tmp)) as dst:
+        with _db_closing(sqlite3.connect(str(path), timeout=30)) as src, \
+                _db_closing(sqlite3.connect(str(tmp))) as dst:
             src.backup(dst)  # WAL에 아직 남아 있는 데이터까지 포함
+        # src/dst both CLOSED before reading / unlinking the temp file (Windows).
         raw = tmp.read_bytes()
         _db_valid_snapshot(raw)
         return raw
@@ -866,14 +885,9 @@ def _db_sqlite_snapshot():
 
 
 def _db_install_snapshot(raw):
-    _db_valid_snapshot(raw)
-    with _db_tempfile.NamedTemporaryFile(suffix='.sqlite3', delete=False) as f:
-        f.write(raw)
-        tmp = Path(f.name)
-    try:
-        restore_full_db_bytes(raw)
-    finally:
-        tmp.unlink(missing_ok=True)
+    # restore_full_db_bytes already verifies and stages its own temporary DB.
+    # Avoid creating an extra identical temporary file that must be deleted.
+    restore_full_db_bytes(raw)
 
 
 def _db_cloud_push(show_feedback=False):
@@ -931,7 +945,7 @@ def _db_cloud_merge_analysis_from_remote(only_corp: str | None = None) -> int:
         tmp = Path(f.name)
     imported = 0
     try:
-        with sqlite3.connect(str(tmp)) as remote:
+        with _db_closing(sqlite3.connect(str(tmp))) as remote:
             remote.row_factory = sqlite3.Row
             if not remote.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='company_analysis'"
@@ -1037,7 +1051,7 @@ def _db_has_usable_local_master() -> bool:
     if not DB_PATH.is_file():
         return False
     try:
-        with sqlite3.connect(str(DB_PATH), timeout=2) as conn:
+        with _db_closing(sqlite3.connect(str(DB_PATH), timeout=2)) as conn:
             exists = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='corp_master'"
             ).fetchone()
