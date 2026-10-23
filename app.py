@@ -919,7 +919,7 @@ def _db_cloud_merge_analysis_from_remote(only_corp: str | None = None) -> int:
     if only_corp is not None and not re.fullmatch(r"[0-9]{8}", str(only_corp)):
         raise ValueError('DART 법인 고유번호는 8자리 숫자여야 합니다.')
 
-    response = requests.get(cfg['read_url'], headers=cfg['headers'], timeout=(10, 120))
+    response = requests.get(cfg['read_url'], headers=cfg['headers'], timeout=(4, 15))
     if response.status_code == 404:
         raise RuntimeError('Supabase에 저장된 SQLite 백업이 없습니다.')
     response.raise_for_status()
@@ -1003,7 +1003,7 @@ def _db_cloud_restore_on_boot():
         return 'not_configured'
     try:
         response = requests.get(cfg['read_url'], headers=cfg['headers'],
-                                timeout=(10, 180))
+                                timeout=(4, 15))
         if response.status_code == 404:
             # Storage is empty: seed it with a preexisting, valid DB if present.
             if DB_PATH.exists():
@@ -1026,6 +1026,26 @@ def _db_cloud_restore_on_boot():
 def _db_boot_once(bucket_object, config_fingerprint):
     # No key in cache key: fingerprint only, not the secret. Cache is per server.
     return _db_cloud_restore_on_boot()
+
+
+def _db_has_usable_local_master() -> bool:
+    """기존 로컬 DB의 회사목록이 있으면 원격 복원 때문에 화면을 멈추지 않는다.
+
+    app.py만 새 폴더에서 실행하면 옛 폴더의 DB는 자동으로 따라오지 않는다.
+    그 경우에는 Supabase 복원을 시도하고, 실패해도 복구 UI를 표시한다.
+    """
+    if not DB_PATH.is_file():
+        return False
+    try:
+        with sqlite3.connect(str(DB_PATH), timeout=2) as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='corp_master'"
+            ).fetchone()
+            if not exists:
+                return False
+            return conn.execute("SELECT EXISTS(SELECT 1 FROM corp_master LIMIT 1)").fetchone()[0] == 1
+    except (sqlite3.Error, OSError):
+        return False
 
 
 def _db_startup_restore():
@@ -2636,38 +2656,60 @@ offline_mode = st.checkbox(
 )
 dart_enabled = bool(api_key) and not offline_mode
 
+# 로컬 DB가 존재하는 PC에서는 원격 DB 다운로드보다 화면 표시를 우선합니다.
+# 새 배포 환경처럼 로컬 법인 DB가 없을 때만 Supabase를 자동 복원합니다.
 try:
-    _db_startup_state = _db_startup_restore()
+    if _db_has_usable_local_master():
+        _db_startup_state = 'local_ready'
+    else:
+        with st.spinner('저장된 법인 DB를 확인하고 있습니다. 로컬 DB가 없어 Supabase 백업을 복원하는 중입니다...'):
+            _db_startup_state = _db_startup_restore()
     init_local_db()
     corp_df = load_saved_corp_master()
 except Exception as e:
-    st.error(f"로컬 DB 초기화/불러오기 실패: {e}")
+    st.error(f"로컬 DB 초기화/불러오기 실패: {type(e).__name__}: {e}")
+    st.caption(f"확인 중인 DB 경로: {DB_PATH}")
     st.stop()
 
-# DB가 비어 있을 때에만 최초 DART 법인목록을 자동 저장합니다.
-if corp_df.empty and dart_enabled:
-    try:
-        with st.spinner("최초 1회 DART 법인목록을 수집하고 로컬 DB에 저장 중입니다..."):
-            fresh_df = load_corp_codes(api_key)
-            sync_corp_master(fresh_df)
-            set_db_meta("corp_master_updated_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-            _db_cloud_push()
-            corp_df = load_saved_corp_master()
-    except Exception as e:
-        st.error(f"최초 DART 법인목록 구축에 실패했습니다: {type(e).__name__}: {e}")
-
 if corp_df.empty:
-    _db_cloud_indicator()
-    st.warning("아직 저장된 법인 DB가 없습니다. 인터넷이 되는 PC에서 최초 DB를 구축하거나 전체 SQLite 백업파일을 복원해 주세요.")
-    startup_restore = st.file_uploader("전체 SQLite DB 백업 복원", type=["sqlite3", "db"], key="startup_full_restore")
-    if startup_restore is not None and st.button("저장 DB 복원", type="primary", key="startup_full_restore_btn"):
+    st.warning('현재 폴더에 조회 가능한 법인 DB가 없습니다. app.py만 다른 폴더로 옮기면 이전 폴더의 DB는 자동으로 복사되지 않습니다.')
+    st.caption(f'현재 DB 경로: {DB_PATH}')
+    if st.session_state.get('_db_cloud_error'):
+        st.caption('Supabase 자동 복원에 실패했습니다. 아래 버튼으로 재시도하거나 기존 DB를 업로드할 수 있습니다.')
+
+    if st.button('☁️ Supabase 저장 DB 다시 가져오기', key='startup_cloud_restore_retry', type='primary'):
         try:
-            restore_full_db_bytes(startup_restore.getvalue())
-            _db_cloud_push()
-            st.success("DB를 복원했습니다.")
+            with st.spinner('Supabase에 저장된 전체 법인 DB를 가져오는 중입니다...'):
+                result = _db_cloud_restore_on_boot()  # 캐시를 통하지 않는 명시적 재시도
+            if result in ('restored', 'seeded'):
+                st.session_state.pop('_db_cloud_error', None)
+                st.success('법인 DB를 복구했습니다.')
+                st.rerun()
+            else:
+                st.warning('Supabase에서 복구할 DB를 확인하지 못했습니다. 설정과 네트워크를 점검해 주세요.')
+        except Exception as exc:
+            st.error(f'클라우드 DB 복구 실패: {type(exc).__name__}')
+
+    if dart_enabled and st.button('🌐 DART 법인 고유번호 목록 최초 구축', key='startup_dart_master', type='secondary'):
+        try:
+            with st.spinner('DART에서 법인 고유번호 목록을 수집하는 중입니다...'):
+                fresh_df = load_corp_codes(api_key)
+                sync_corp_master(fresh_df)
+                set_db_meta('corp_master_updated_at', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+                _db_cloud_push()
+            st.success('법인목록을 구축했습니다.')
             st.rerun()
         except Exception as exc:
-            st.error(f"복원 실패: {exc}")
+            st.error(f'DART 최초 법인목록 구축 실패: {type(exc).__name__}: {exc}')
+
+    startup_restore = st.file_uploader('기존 corp_finder_cache.sqlite3 수동 복원', type=['sqlite3', 'db'], key='startup_full_restore')
+    if startup_restore is not None and st.button('업로드한 DB 복원', key='startup_full_restore_btn'):
+        try:
+            restore_full_db_bytes(startup_restore.getvalue())
+            st.success('로컬 DB를 복원했습니다. 화면을 새로고침합니다.')
+            st.rerun()
+        except Exception as exc:
+            st.error(f'복원 실패: {type(exc).__name__}: {exc}')
     st.stop()
 
 _db_cloud_indicator()
