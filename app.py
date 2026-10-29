@@ -698,6 +698,11 @@ def init_local_db():
             );
             """
         )
+    # DB 스냅샷/기존 Cloud DB는 새 퇴직연금 테이블이 없을 수 있습니다.
+    # 앱 시작/복원 시 CREATE TABLE IF NOT EXISTS 로 안전하게 스키마만 추가합니다.
+    # 기존 법인 데이터, 분석 결과, 영업 메모는 삭제하거나 초기화하지 않습니다.
+    _pension_target_init()
+    _pension_employee_init()
 
 
 def set_db_meta(key: str, value: str):
@@ -3008,7 +3013,9 @@ def _pension_target_classify(result):
 
 def _pension_target_load(corp_master, external_df=None):
     """저장된 감사보고서 분석과 외부 법인목록을 결합. 신규 DART 호출 없음."""
+    # 초기화 순서가 달라지는 Cloud 재시작·구형 DB 복원도 안전하게 처리
     _pension_target_init()
+    _pension_employee_init()
     with get_db_connection() as conn:
         analyses = conn.execute('''SELECT a.corp_code, a.result_json, a.analyzed_at,
                 p.corp_name AS profile_name, p.adres AS profile_addr, p.phn_no AS profile_phone
