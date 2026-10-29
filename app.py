@@ -624,6 +624,7 @@ EXTERNAL_COL_CANDIDATES = {
     "전화번호": ["전화번호", "전화", "소재지전화", "사업장 번호", "사업장번호"],
     "사업자등록번호": ["사업자등록번호", "사업자번호"],
     "법인등록번호": ["법인등록번호", "법인번호"],
+    "종업원수": ["상시근로자수", "종업원수", "직원수", "근로자수", "임직원수"],
 }
 
 
@@ -820,11 +821,13 @@ def restore_full_db_bytes(raw: bytes):
 # Never expose the service-role key in the repository or the UI.
 # =========================================================
 import hashlib as _db_hashlib
+import gzip as _db_gzip
 import tempfile as _db_tempfile
 from contextlib import closing as _db_closing
 from urllib.parse import quote as _db_quote
 
-_DB_CLOUD_OBJECT = 'corporate/corp_finder_cache.sqlite3'
+_DB_CLOUD_LEGACY_OBJECT = 'corporate/corp_finder_cache.sqlite3'
+_DB_CLOUD_OBJECT = 'corporate/corp_finder_cache_v2.sqlite3.gz'
 _DB_CLOUD_CONFIG_ERROR = ''
 
 
@@ -840,10 +843,40 @@ def _db_cloud_config():
         raise RuntimeError('SUPABASE_BUCKET 설정을 확인해 주세요.')
     prefix = url + '/storage/v1/object/'
     suffix = _db_quote(bucket, safe='') + '/' + _db_quote(_DB_CLOUD_OBJECT, safe='/')
+    legacy_suffix = _db_quote(bucket, safe='') + '/' + _db_quote(_DB_CLOUD_LEGACY_OBJECT, safe='/')
     return {'read_url': prefix + 'authenticated/' + suffix,
              'write_url': prefix + suffix,
+             'legacy_read_url': prefix + 'authenticated/' + legacy_suffix,
              'headers': {'apikey': key, 'Authorization': 'Bearer ' + key},
              'bucket': bucket}
+
+
+
+def _db_download_snapshot(cfg, *, allow_missing=False):
+    """Read compressed v2 backup; fall back to *read-only* legacy .sqlite3.
+
+    New backups never overwrite the old legacy object. Both versions are
+    validated by their callers before attaching to the live database.
+    """
+    for url, compressed in ((cfg['read_url'], True),
+                            (cfg['legacy_read_url'], False)):
+        response = requests.get(url, headers=cfg['headers'], timeout=(6, 45))
+        if response.status_code == 404:
+            continue
+        response.raise_for_status()
+        if compressed:
+            try:
+                raw = _db_gzip.decompress(response.content)
+            except (_db_gzip.BadGzipFile, EOFError, OSError) as exc:
+                raise RuntimeError('압축된 Supabase 백업 파일이 손상되었습니다.') from exc
+        else:
+            raw = response.content
+        if not raw.startswith(b'SQLite format 3\x00'):
+            raise RuntimeError('Supabase 백업 파일 형식이 올바르지 않습니다.')
+        return raw
+    if allow_missing:
+        return None
+    raise RuntimeError('Supabase에 저장된 법인 DB 백업이 없습니다.')
 
 
 def _db_valid_snapshot(raw):
@@ -890,33 +923,59 @@ def _db_install_snapshot(raw):
     restore_full_db_bytes(raw)
 
 
+
 def _db_cloud_push(show_feedback=False):
+    """Validate snapshot, gzip it, and upload as a *new* Storage object.
+
+    Keeps the previous .sqlite3 backup untouched in case first migration
+    fails. Does not report success until Storage returns an HTTP success.
+    """
     cfg = _db_cloud_config()
     if cfg is None:
+        if show_feedback:
+            st.warning('Supabase 저장 설정이 없습니다.')
         return False
+    raw_size = 0
+    zip_size = 0
     try:
-        # 다른 PC/Cloud 세션에서 올린 기존 분석 결과가 뒤늦은 전체 DB 업로드로
-        # 사라지는 일을 줄인다. 네트워크 불가 때에는 로컬 백업 기능을 유지한다.
+        # Retain results from another PC/session when the existing backup is readable.
         try:
             _db_cloud_merge_analysis_from_remote()
         except Exception:
             pass
-        raw = _db_sqlite_snapshot()
+        raw = _db_sqlite_snapshot()  # includes a full integrity check
+        raw_size = len(raw)
+        packed = _db_gzip.compress(raw, compresslevel=6, mtime=0)
+        zip_size = len(packed)
         headers = dict(cfg['headers'])
-        headers.update({'Content-Type': 'application/x-sqlite3',
+        headers.update({'Content-Type': 'application/gzip',
                         'x-upsert': 'true', 'cache-control': 'no-cache'})
-        response = requests.post(cfg['write_url'], headers=headers, data=raw,
-                                 timeout=(10, 180))
+        response = requests.post(cfg['write_url'], headers=headers, data=packed,
+                                 timeout=(15, 180))
         response.raise_for_status()
         st.session_state['_db_cloud_saved_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         st.session_state.pop('_db_cloud_error', None)
         if show_feedback:
-            st.success('☁️ 최신 SQLite DB가 비공개 저장소에 백업되었습니다.')
+            st.success(f'☁️ DB 압축 백업 완료: {raw_size/1048576:.1f}MB → '
+                       f'{zip_size/1048576:.1f}MB (Supabase 저장 성공)')
         return True
     except Exception as exc:
-        st.session_state['_db_cloud_error'] = str(exc)
+        # Exception text never embeds API keys in this path; display only safe type.
+        if isinstance(exc, requests.exceptions.Timeout) or 'timed out' in str(exc).lower():
+            reason = '클라우드 전송 시간 초과 (Supabase 연결 또는 네트워크 문제)'
+        elif isinstance(exc, requests.exceptions.HTTPError):
+            status = getattr(getattr(exc, 'response', None), 'status_code', '알 수 없음')
+            reason = f'Supabase HTTP {status}'
+        elif isinstance(exc, requests.exceptions.ConnectionError):
+            reason = 'Supabase 네트워크 연결 오류'
+        else:
+            reason = f'{type(exc).__name__}: {exc}'
+        st.session_state['_db_cloud_error'] = reason
         if show_feedback:
-            st.error(f'클라우드 DB 백업 실패. 현재 서버의 DB는 유지됩니다: {exc}')
+            st.error(f'클라우드 DB 백업 실패: {reason}. 로컬 DB는 유지됩니다.')
+            if raw_size:
+                st.caption(f'전송 데이터: 원본 {raw_size/1048576:.1f}MB → '
+                           f'압축 {zip_size/1048576:.1f}MB')
         return False
 
 
@@ -933,11 +992,7 @@ def _db_cloud_merge_analysis_from_remote(only_corp: str | None = None) -> int:
     if only_corp is not None and not re.fullmatch(r"[0-9]{8}", str(only_corp)):
         raise ValueError('DART 법인 고유번호는 8자리 숫자여야 합니다.')
 
-    response = requests.get(cfg['read_url'], headers=cfg['headers'], timeout=(4, 15))
-    if response.status_code == 404:
-        raise RuntimeError('Supabase에 저장된 SQLite 백업이 없습니다.')
-    response.raise_for_status()
-    raw = response.content
+    raw = _db_download_snapshot(cfg)
     _db_valid_snapshot(raw)
 
     with _db_tempfile.NamedTemporaryFile(suffix='.sqlite3', delete=False) as f:
@@ -1005,6 +1060,97 @@ def _db_cloud_merge_analysis_from_remote(only_corp: str | None = None) -> int:
                                     f'INSERT OR REPLACE INTO company_profile({column_list}) VALUES({placeholders})',
                                     values,
                                 )
+                # 퇴직연금 영업정보도 기존 원격 SQLite 스냅샷에서 최신 행만 병합.
+                meta_exists = bool(remote.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pension_target_meta'"
+                ).fetchone())
+                target_imported = 0
+                if meta_exists:
+                    local.execute('''CREATE TABLE IF NOT EXISTS pension_target_meta (
+                        corp_code TEXT PRIMARY KEY,
+                        employee_count INTEGER,
+                        contact_stage TEXT NOT NULL DEFAULT '미접촉',
+                        contact_note TEXT NOT NULL DEFAULT '',
+                        updated_at TEXT NOT NULL DEFAULT ''
+                    )''')
+                    if only_corp is None:
+                        meta_rows = remote.execute('SELECT * FROM pension_target_meta').fetchall()
+                    else:
+                        meta_rows = remote.execute(
+                            'SELECT * FROM pension_target_meta WHERE corp_code=?', (str(only_corp),)
+                        ).fetchall()
+                    for info in meta_rows:
+                        code = str(info['corp_code'])
+                        if not re.fullmatch(r'\d{8}', code):
+                            continue
+                        old = local.execute(
+                            'SELECT updated_at FROM pension_target_meta WHERE corp_code=?', (code,)
+                        ).fetchone()
+                        if old and str(old['updated_at'] or '') >= str(info['updated_at'] or ''):
+                            continue
+                        local.execute('''INSERT INTO pension_target_meta
+                             (corp_code, employee_count, contact_stage, contact_note, updated_at)
+                             VALUES(?,?,?,?,?) ON CONFLICT(corp_code) DO UPDATE SET
+                             employee_count=excluded.employee_count,
+                             contact_stage=excluded.contact_stage,
+                             contact_note=excluded.contact_note,
+                             updated_at=excluded.updated_at''',
+                             (code, info['employee_count'], info['contact_stage'],
+                              str(info['contact_note'] or '')[:2000], str(info['updated_at'] or '')))
+                        target_imported += 1
+                st.session_state['_pension_meta_imported'] = target_imported
+                # OpenDART 직원현황도 최신 조회 결과만 병합 (기존 수동 입력 테이블은 별도 유지).
+                employee_exists = bool(remote.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pension_employee_dart'"
+                ).fetchone())
+                if employee_exists:
+                    local.execute('''CREATE TABLE IF NOT EXISTS pension_employee_dart (
+                       corp_code TEXT PRIMARY KEY, employee_count INTEGER NOT NULL,
+                       report_year TEXT NOT NULL, report_code TEXT NOT NULL,
+                       report_date TEXT NOT NULL DEFAULT '', report_url TEXT NOT NULL DEFAULT '',
+                       checked_at TEXT NOT NULL)''')
+                    if only_corp is None:
+                        employee_rows=remote.execute('SELECT * FROM pension_employee_dart').fetchall()
+                    else:
+                        employee_rows=remote.execute('SELECT * FROM pension_employee_dart WHERE corp_code=?',(str(only_corp),)).fetchall()
+                    for row in employee_rows:
+                        code=str(row['corp_code'])
+                        if not re.fullmatch(r'\d{8}',code):
+                            continue
+                        old=local.execute('SELECT checked_at FROM pension_employee_dart WHERE corp_code=?',(code,)).fetchone()
+                        if old and str(old['checked_at'] or '')>=str(row['checked_at'] or ''):
+                            continue
+                        local.execute('''INSERT INTO pension_employee_dart
+                           (corp_code,employee_count,report_year,report_code,report_date,report_url,checked_at)
+                           VALUES (?,?,?,?,?,?,?) ON CONFLICT(corp_code) DO UPDATE SET
+                           employee_count=excluded.employee_count,report_year=excluded.report_year,
+                           report_code=excluded.report_code,report_date=excluded.report_date,
+                           report_url=excluded.report_url,checked_at=excluded.checked_at''',
+                           (code,row['employee_count'],row['report_year'],row['report_code'],
+                            row['report_date'],row['report_url'],row['checked_at']))
+                check_exists=bool(remote.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pension_employee_check'"
+                ).fetchone())
+                if check_exists:
+                    local.execute("""CREATE TABLE IF NOT EXISTS pension_employee_check (
+                        corp_code TEXT PRIMARY KEY, status TEXT NOT NULL,
+                        detail TEXT NOT NULL DEFAULT '', checked_at TEXT NOT NULL)""")
+                    if only_corp is None:
+                        check_rows=remote.execute('SELECT * FROM pension_employee_check').fetchall()
+                    else:
+                        check_rows=remote.execute('SELECT * FROM pension_employee_check WHERE corp_code=?',(str(only_corp),)).fetchall()
+                    for row in check_rows:
+                        code=str(row['corp_code'])
+                        if not re.fullmatch(r'\d{8}',code):
+                            continue
+                        prior=local.execute('SELECT checked_at FROM pension_employee_check WHERE corp_code=?',(code,)).fetchone()
+                        if prior and str(prior['checked_at'] or '')>=str(row['checked_at'] or ''):
+                            continue
+                        local.execute("""INSERT INTO pension_employee_check
+                          (corp_code,status,detail,checked_at) VALUES (?,?,?,?)
+                          ON CONFLICT(corp_code) DO UPDATE SET status=excluded.status,
+                          detail=excluded.detail,checked_at=excluded.checked_at""",
+                          (code,row['status'],row['detail'],row['checked_at']))
         return imported
     finally:
         tmp.unlink(missing_ok=True)
@@ -1016,9 +1162,8 @@ def _db_cloud_restore_on_boot():
     if cfg is None:
         return 'not_configured'
     try:
-        response = requests.get(cfg['read_url'], headers=cfg['headers'],
-                                timeout=(4, 15))
-        if response.status_code == 404:
+        raw = _db_download_snapshot(cfg, allow_missing=True)
+        if raw is None:
             # Storage is empty: seed it with a preexisting, valid DB if present.
             if DB_PATH.exists():
                 try:
@@ -1028,8 +1173,7 @@ def _db_cloud_restore_on_boot():
                 except Exception:
                     pass
             return 'remote_empty'
-        response.raise_for_status()
-        _db_install_snapshot(response.content)
+        _db_install_snapshot(raw)
         return 'restored'
     except Exception as exc:
         st.session_state['_db_cloud_error'] = '초기 DB 동기화 실패: ' + str(exc)
@@ -1086,23 +1230,24 @@ def _db_cloud_indicator():
         if st.session_state.get('_db_cloud_error'):
             st.warning('☁️ 최근 동기화 오류: ' + st.session_state['_db_cloud_error'])
         else:
-            st.caption('☁️ 비공개 클라우드 DB 연결됨 · 서버 시작 시 자동 복원 · 수동으로 PC 분석 결과 새로고침 가능')
+            st.caption('☁️ Supabase 설정 확인 · 마지막 백업 성공 여부는 저장 버튼 결과를 확인하세요')
         if st.session_state.get('_db_cloud_saved_at'):
             st.caption('마지막 클라우드 백업: ' + st.session_state['_db_cloud_saved_at'])
         sync_left, sync_right = st.columns(2)
         with sync_left:
-            if st.button('☁️ 현재 DB 영구 저장', key='corp_cloud_save_btn'):
+            if st.button('☁️ 현재 DB 영구 저장 (압축)', key='corp_cloud_save_btn'):
                 _db_cloud_push(show_feedback=True)
         with sync_right:
-            if st.button('📥 PC 최신 분석 결과 가져오기', key='corp_cloud_pull_analysis_btn'):
+            if st.button('📥 PC 최신 분석·영업정보 가져오기', key='corp_cloud_pull_analysis_btn'):
                 try:
                     with st.spinner('Supabase DB에서 PC가 분석한 결과를 확인하고 병합하는 중입니다...'):
                         count = _db_cloud_merge_analysis_from_remote()
-                    if count:
-                        st.success(f'새로운/갱신된 분석 결과 {count:,}건을 가져왔습니다.')
+                    meta_count = st.session_state.pop('_pension_meta_imported', 0)
+                    if count or meta_count:
+                        st.success(f'신규/갱신 분석 {count:,}건 · 퇴직연금 영업정보 {meta_count:,}건 가져왔습니다.')
                         st.rerun()
                     else:
-                        st.info('가져올 신규 분석 결과가 없습니다. PC에서 정상 분석 후 Supabase 저장 여부를 확인해 주세요.')
+                        st.info('가져올 신규 분석·퇴직연금 영업정보가 없습니다. PC에서 Supabase 저장 여부를 확인해 주세요.')
                 except Exception as exc:
                     st.error(f'최신 분석 결과 가져오기 실패: {_dart_safe_error(exc) if isinstance(exc, requests.exceptions.RequestException) else exc}')
 
@@ -2605,6 +2750,677 @@ def render_visit_report_exports(result, widget_key, external_meta=None):
 
 
 # =========================================================
+# =========================================================
+# 신규: 퇴직급여 사외적립 제도 대응 타깃 발굴 (2026-10-30)
+# 기존 거래은행/DART/SQLite/Supabase 분석과 독립적으로 동작합니다.
+# 근로자 수는 감사보고서 키워드만으로 추정하지 않습니다.
+# =========================================================
+PENSION_POLICY_SOURCE = 'https://www.moel.go.kr/news/enews/report/enewsView.do?news_seq=20160'
+PENSION_LEAD_STAGES = ['미접촉', '접촉 예정', '전화 완료', '미팅 예정', '제안서 전달', '수주', '보류']
+
+
+def _pension_target_init():
+    """기존 테이블은 변경하지 않고 영업 메모용 보조 테이블만 추가."""
+    with get_db_connection() as conn:
+        conn.execute('''CREATE TABLE IF NOT EXISTS pension_target_meta (
+            corp_code TEXT PRIMARY KEY,
+            employee_count INTEGER,
+            contact_stage TEXT NOT NULL DEFAULT '미접촉',
+            contact_note TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        )''')
+
+
+def _pension_employee_init():
+    with get_db_connection() as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS pension_employee_dart (
+            corp_code TEXT PRIMARY KEY,
+            employee_count INTEGER NOT NULL,
+            report_year TEXT NOT NULL,
+            report_code TEXT NOT NULL,
+            report_date TEXT NOT NULL DEFAULT '',
+            report_url TEXT NOT NULL DEFAULT '',
+            checked_at TEXT NOT NULL
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS pension_employee_check (
+            corp_code TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            detail TEXT NOT NULL DEFAULT '',
+            checked_at TEXT NOT NULL
+        )""")
+
+
+def _pension_int(value):
+    if value is None or isinstance(value, bool):
+        return None
+    s = str(value).strip().replace(',', '').replace('명', '').replace(' ', '')
+    if not s or s.lower() in ('nan', 'none', '미확인', '-', 'null'):
+        return None
+    if not re.fullmatch(r'\d+(?:\.0+)?', s):
+        return None
+    n = int(float(s))
+    return n if 1 <= n <= 1000000 else None
+
+
+# DART 정기보고서 직원현황 API: 감사보고서(document.xml)와는 별도 출처입니다.
+# 원문에 직원 수가 없으면 추정하지 않으며 사업보고서 미제출 법인은 자료가 없을 수 있습니다.
+def _pension_employee_periods(now=None):
+    now = now or date.today()
+    y = now.year
+    periods = []
+    if now.month >= 11:
+        periods.append((str(y), '11014'))  # 3분기 보고서
+    if now.month >= 9:
+        periods.append((str(y), '11012'))  # 반기 보고서
+    if now.month >= 5:
+        periods.append((str(y), '11013'))  # 1분기 보고서
+    # 최신 사업보고서 및 전년도 보고서; 장기 자료의 현직원수 오인 방지
+    periods.append((str(y-1), '11011'))
+    return periods[:4]
+
+
+def _pension_employee_count_from_rows(items):
+    """DART sm(합계)만 활용. 부문/성별 소계와 상세를 중복 합산하지 않는다."""
+    valid=[]
+    for row in items or []:
+        if not isinstance(row, dict):
+            continue
+        n=_pension_int(row.get('sm'))
+        if n is None:
+            continue
+        group=re.sub(r'\s+', '', str(row.get('fo_bbm') or ''))
+        sex=re.sub(r'\s+', '', str(row.get('sexdstn') or ''))
+        valid.append((n, group, sex))
+    if not valid:
+        return None
+    overall = [r for r in valid if re.fullmatch(r'(?:총계|합계|전체|계|전사)', r[1])]
+    if overall:
+        all_sex = [r[0] for r in overall if r[2] in ('계','합계','전체','총계','')]
+        if all_sex:
+            return max(all_sex)
+        return sum(n for n,g,sex in overall if sex in ('남','여','기타')) or None
+    # 부문별 행: 동일 부문에서 성별 '계'와 남/여가 동시에 있으면 계만 사용
+    groups={}
+    for n,g,sex in valid:
+        groups.setdefault(g,[]).append((n,sex))
+    total=0
+    for grp in groups.values():
+        subs=[n for n,sex in grp if sex in ('계','합계','전체','총계','')]
+        if subs:
+            total += max(subs)
+        else:
+            total += sum(n for n,sex in grp if sex in ('남','여','기타'))
+    return total if total>0 else None
+
+
+def _pension_employee_lookup(api_key, corp_code, now=None):
+    """명시적 사용/분석 실행 시만 호출. 정상 013은 다음 보고서를 탐색."""
+    if not api_key or not re.fullmatch(r'\d{8}', str(corp_code)):
+        raise ValueError('DART API 키와 8자리 법인번호가 필요합니다.')
+    empty_periods=[]
+    for yr,code in _pension_employee_periods(now):
+        result=request_json(f'{DART_BASE}/empSttus.json', {
+            'crtfc_key':api_key, 'corp_code':str(corp_code),
+            'bsns_year':yr,'reprt_code':code},timeout=12)
+        if str(result.get('status','000'))=='013':
+            empty_periods.append(f'{yr}/{code}')
+            continue
+        count=_pension_employee_count_from_rows(result.get('list') or [])
+        if count is not None:
+            rows=result.get('list') or []
+            dates=[str(r.get('stlm_dt','')) for r in rows if isinstance(r,dict) and r.get('stlm_dt')]
+            receipts=[str(r.get('rcept_no','')) for r in rows if isinstance(r,dict)]
+            receipt=next((x for x in receipts if re.fullmatch(r'\d{14}',x)), '')
+            return {'employee_count':count,'report_year':yr,'report_code':code,
+                    'report_date':max(dates) if dates else '',
+                    'report_url':f'https://dart.fss.or.kr/dsaf001/main.do?rcpNo={receipt}' if receipt else ''}
+        empty_periods.append(f'{yr}/{code}:인원 숫자 없음')
+    _pension_employee_log(corp_code,'미공개','최신 정기보고서 직원현황 없음')
+    return None
+
+
+def _pension_employee_save(corp_code, data):
+    _pension_employee_init()
+    if not re.fullmatch(r'\d{8}',str(corp_code)):
+        raise ValueError('법인번호 형식이 올바르지 않습니다.')
+    count=_pension_int(data.get('employee_count'))
+    if count is None:
+        raise ValueError('공시에서 유효한 인원수를 확인하지 못했습니다.')
+    with get_db_connection() as conn:
+        conn.execute("""INSERT INTO pension_employee_dart
+          (corp_code,employee_count,report_year,report_code,report_date,report_url,checked_at)
+          VALUES (?,?,?,?,?,?,?) ON CONFLICT(corp_code) DO UPDATE SET
+          employee_count=excluded.employee_count,report_year=excluded.report_year,
+          report_code=excluded.report_code,report_date=excluded.report_date,
+          report_url=excluded.report_url,checked_at=excluded.checked_at""",
+          (str(corp_code),count,str(data['report_year']),str(data['report_code']),
+           str(data.get('report_date','')),str(data.get('report_url','')),
+           datetime.now().isoformat(timespec='seconds')))
+    _pension_employee_log(corp_code,'확인',f'{count}명 / {data["report_year"]}년')
+
+
+def _pension_employee_saved(corp_code):
+    _pension_employee_init()
+    with get_db_connection() as conn:
+        item=conn.execute('SELECT * FROM pension_employee_dart WHERE corp_code=?',(str(corp_code),)).fetchone()
+    return dict(item) if item is not None else None
+
+
+def _pension_employee_log(corp_code, status, detail=''):
+    _pension_employee_init()
+    if not re.fullmatch(r'\d{8}',str(corp_code)):
+        return
+    with get_db_connection() as conn:
+        conn.execute("""INSERT INTO pension_employee_check (corp_code,status,detail,checked_at)
+            VALUES (?,?,?,?) ON CONFLICT(corp_code) DO UPDATE SET
+            status=excluded.status,detail=excluded.detail,checked_at=excluded.checked_at""",
+            (str(corp_code),str(status)[:30],str(detail or '')[:180],datetime.now().isoformat(timespec='seconds')))
+
+
+def _pension_employee_recent_checks():
+    _pension_employee_init()
+    with get_db_connection() as conn:
+        rows=conn.execute('SELECT * FROM pension_employee_check').fetchall()
+    return {str(r['corp_code']):dict(r) for r in rows}
+
+
+def _pension_employee_effective(corp_code, fallback=None):
+    """직접 확인 인원 > 외부 기업목록 인원 > DART 보고서 참고 인원."""
+    _pension_target_init()
+    _pension_employee_init()
+    with get_db_connection() as conn:
+        manual=conn.execute('SELECT employee_count FROM pension_target_meta WHERE corp_code=?',(str(corp_code),)).fetchone()
+    n=_pension_int(manual['employee_count']) if manual is not None else None
+    if n is not None:
+        return n,'담당자 확인/수동 입력', None
+    ext=_pension_int(fallback)
+    if ext is not None:
+        return ext,'외부 기업목록',None
+    saved=_pension_employee_saved(corp_code)
+    if saved:
+        return saved['employee_count'],f'DART 정기보고서 {saved["report_year"]}년 참고',saved
+    return None,'확인 불가',None
+
+
+def _render_pension_employee_section(corp_code, api_key, enabled, external_count=None, key='pension'):
+    """기존 개별 법인 분석 화면에도 직원 수와 시행연도, 원문을 항상 표시한다."""
+    st.markdown('#### 👥 종업원 수 · 의무화 적용시기 검토')
+    number, source, dart_row = _pension_employee_effective(corp_code,external_count)
+    a,b,c=st.columns([1,1.2,2])
+    a.metric('직원 수',f'{number:,}명' if number is not None else '미확인')
+    b.metric('사외적립 의무화',_pension_policy_year(number))
+    c.caption(f'**인원 출처:** {source}')
+    if dart_row:
+        c.caption(f'공시 기준: {dart_row["report_date"] or dart_row["report_year"]} · 조회 저장: {dart_row["checked_at"][:10]}')
+        if dart_row.get('report_url'):
+            c.link_button('직원현황 공시 원문',dart_row['report_url'])
+    st.caption('DART 직원현황은 사업·반기·분기보고서상의 참고 인원이며 법정 상시근로자 수나 퇴직연금 가입 인원과 다를 수 있습니다.')
+    recent=_pension_employee_recent_checks().get(str(corp_code))
+    if recent and not dart_row and number is None:
+        st.caption(f'DART 조회기록: {recent["status"]} · {recent["checked_at"][:10]} (새로 조회하려면 아래 버튼)')
+    if enabled:
+        if st.button('🔎 DART 직원현황 조회·갱신',key=key+'_emp_refresh'):
+            try:
+                with st.spinner('최신 정기보고서의 직원현황을 확인하고 있습니다...'):
+                    record=_pension_employee_lookup(api_key,str(corp_code))
+                if record:
+                    _pension_employee_save(corp_code,record)
+                    if not _db_cloud_push():
+                        st.warning('로컬 저장 완료, Supabase 백업 상태는 별도 확인해 주세요.')
+                    st.success(f'DART 공시 기준 {record["employee_count"]:,}명 저장')
+                    st.rerun()
+                else:
+                    st.info('DART 정기보고서 직원현황 자료가 없습니다. 감사보고서만 제출하는 법인 등은 직원 수를 조회하지 못할 수 있습니다. 타깃 탭에서 수동/엑셀 등록이 가능합니다.')
+            except Exception as exc:
+                _pension_employee_log(corp_code,'조회 오류',type(exc).__name__)
+                st.warning(f'DART 직원현황 조회 실패: {type(exc).__name__}: {str(exc)[:170]}')
+    else:
+        st.caption('오프라인 모드 또는 DART API 키 미설정: 저장된 정보만 표시됩니다.')
+
+
+def _pension_policy_year(count):
+    if count is None:
+        return '인원 확인 필요'
+    if count >= 100:
+        return '2028년(추진안)'
+    if count >= 10:
+        return '2029년(추진안)'
+    return '2030년(추진안)'
+
+
+def _pension_target_classify(result):
+    """미도입 확정/추정 비율을 생성하지 않음. 공시 근거 단계만 표시."""
+    if not result or result.get('error') or not result.get('report'):
+        return ('미분석', '감사보고서 분석 필요', 4, '감사보고서 미분석·원문 점검')
+    pen = result.get('pension') or {}
+    op = str(pen.get('운영분류') or '확인 불가')
+    if op == '미운용 확인':
+        return ('미도입 후보', '명시적 미운용 문구 · 원문 재확인 필수', 1, '공시일·적용대상·현재 도입 여부 확인')
+    if op in ('DB형 운영', 'DC형 운영', 'DB+DC 혼합'):
+        return ('기존 운영', op + ' · 사업자/운용 점검 대상', 5, '퇴직연금사업자·적립수준·운용 현황 확인')
+    if str(pen.get('판별신뢰')) == '상충 근거':
+        return ('상충 근거', '운영·미운영 근거가 함께 발견됨', 3, '회사 전체 기준 및 DB/DC 병행 여부 확인')
+    evidence = bool(pen.get('일반근거') or pen.get('DB근거') or pen.get('DC근거'))
+    if evidence:
+        return ('가입 여부 확인', '퇴직급여 관련 문구만 존재', 2, '실제 가입 여부·퇴직급여제도 확인')
+    return ('자료 부족', '퇴직연금 운영 관련 직접 근거 없음', 3, '감사보고서 주석 및 담당자 추가 확인')
+
+
+def _pension_target_load(corp_master, external_df=None):
+    """저장된 감사보고서 분석과 외부 법인목록을 결합. 신규 DART 호출 없음."""
+    _pension_target_init()
+    with get_db_connection() as conn:
+        analyses = conn.execute('''SELECT a.corp_code, a.result_json, a.analyzed_at,
+                p.corp_name AS profile_name, p.adres AS profile_addr, p.phn_no AS profile_phone
+                FROM company_analysis a
+                LEFT JOIN company_profile p ON a.corp_code=p.corp_code''').fetchall()
+        extra = conn.execute('SELECT corp_code, employee_count, contact_stage, contact_note, updated_at FROM pension_target_meta').fetchall()
+        dart_employee = conn.execute('SELECT * FROM pension_employee_dart').fetchall()
+    meta = {str(x['corp_code']): dict(x) for x in extra}
+    dart_meta = {str(x['corp_code']): dict(x) for x in dart_employee}
+    master = {}
+    norm_to_codes = {}
+    if corp_master is not None and not corp_master.empty:
+        for row in corp_master[['corp_code', 'corp_name', 'norm_name']].fillna('').to_dict('records'):
+            code = str(row['corp_code'])
+            master[code] = str(row['corp_name'])
+            norm = str(row['norm_name']) or normalize_company_name(str(row['corp_name']))
+            norm_to_codes.setdefault(norm, set()).add(code)
+
+    analyses_by_code = {}
+    for x in analyses:
+        code = str(x['corp_code'])
+        try:
+            result = json.loads(x['result_json'])
+            if not isinstance(result, dict):
+                continue
+        except (ValueError, TypeError):
+            continue
+        analyses_by_code[code] = (result, str(x['analyzed_at'] or ''), dict(x))
+
+    external_by_code = {}
+    unmatched = {}
+    if external_df is not None and isinstance(external_df, pd.DataFrame) and not external_df.empty:
+        for row in external_df.fillna('').to_dict('records'):
+            name = str(row.get('법인명') or '').strip()
+            if not name:
+                continue
+            norm = str(row.get('norm_name') or normalize_company_name(name))
+            codes = norm_to_codes.get(norm, set())
+            if len(codes) == 1:
+                code = next(iter(codes))
+                if code not in external_by_code:
+                    external_by_code[code] = row
+            elif norm not in unmatched:
+                unmatched[norm] = (row, '동명법인 확인 필요' if codes else 'DART 매칭 필요')
+
+    all_codes = set(analyses_by_code) | set(external_by_code)
+    rows = []
+    for code in all_codes:
+        record = analyses_by_code.get(code)
+        result, analyzed_at, sqlrow = record if record else (None, '', {})
+        company = (result or {}).get('company') or {}
+        report = (result or {}).get('report') or {}
+        pension = (result or {}).get('pension') or {}
+        external = external_by_code.get(code, {})
+        saved = meta.get(code, {})
+        category, explanation, rank, suggested = _pension_target_classify(result)
+        employees = _pension_int(saved.get('employee_count'))
+        employee_source = '담당자 확인/수동' if employees is not None else ''
+        if employees is None:
+            employees = _pension_int(external.get('종업원수'))
+            if employees is not None:
+                employee_source = '외부 기업목록'
+        dart_observation = dart_meta.get(code, {})
+        if employees is None and dart_observation:
+            employees = _pension_int(dart_observation.get('employee_count'))
+            if employees is not None:
+                employee_source = 'DART 정기보고서(참고)'
+        addr = str(company.get('주소') or sqlrow.get('profile_addr') or external.get('주소') or '')
+        rows.append({
+            '법인명': str(company.get('법인명') or master.get(code) or sqlrow.get('profile_name') or external.get('법인명') or ''),
+            'DART고유번호': code,
+            '주소': addr,
+            '전화번호': str(company.get('전화번호') or sqlrow.get('profile_phone') or external.get('전화번호') or ''),
+            '종업원수': employees,
+            '인원출처': employee_source or '미확인',
+            '인원공시기준': str(dart_observation.get('report_date') or dart_observation.get('report_year') or ''),
+            '시행예정': _pension_policy_year(employees),
+            '대상유형': category,
+            '판별근거': explanation,
+            '영업제안': suggested,
+            '연금운영분류': str(pension.get('운영분류') or '미확인'),
+            '퇴직급여단서수': len(pension.get('일반근거') or []),
+            '사외적립원문수': len(((pension.get('금액관련근거') or {}).get('사외적립자산') or [])),
+            '접수일': str(report.get('접수일') or ''),
+            '분석저장일': analyzed_at[:10],
+            'DART원문': str(report.get('DART링크') or ''),
+            '영업상태': str(saved.get('contact_stage') or '미접촉'),
+            '상담메모': str(saved.get('contact_note') or ''),
+            '출처': ('저장 분석 + 외부기업목록' if code in analyses_by_code and code in external_by_code
+                   else '저장 분석' if code in analyses_by_code else '외부기업목록'),
+            '_rank': rank,
+        })
+    for norm, (ext, matching) in unmatched.items():
+        rows.append({
+            '법인명': str(ext.get('법인명') or ''), 'DART고유번호': '',
+            '주소': str(ext.get('주소') or ext.get('검색주소') or ''),
+            '전화번호': str(ext.get('전화번호') or ''),
+            '종업원수': _pension_int(ext.get('종업원수')),
+            '인원출처': '외부 기업목록' if _pension_int(ext.get('종업원수')) is not None else '미확인',
+            '인원공시기준': '',
+            '시행예정': _pension_policy_year(_pension_int(ext.get('종업원수'))),
+            '대상유형': '미분석', '판별근거': matching,
+            '영업제안': '법인명·DART고유번호 확인 후 신규 분석',
+            '연금운영분류': '미확인', '퇴직급여단서수': 0,
+            '사외적립원문수': 0, '접수일': '', '분석저장일': '', 'DART원문': '',
+            '영업상태': '미접촉', '상담메모': '', '출처': '외부기업목록', '_rank': 4,
+        })
+    columns = ['법인명', 'DART고유번호', '주소', '전화번호', '종업원수', '인원출처', '인원공시기준', '시행예정',
+               '대상유형', '판별근거', '영업제안', '연금운영분류', '퇴직급여단서수',
+               '사외적립원문수', '접수일', '분석저장일', 'DART원문', '영업상태',
+               '상담메모', '출처', '_rank']
+    df = pd.DataFrame(rows, columns=columns)
+    if not df.empty:
+        df = df.sort_values(['_rank', '법인명'], kind='stable').reset_index(drop=True)
+    return df
+
+
+def _pension_target_save(code, *, headcount=None, stage='미접촉', note=''):
+    if not re.fullmatch(r'\d{8}', str(code)):
+        raise ValueError('DART 8자리 코드가 확인된 법인만 영업메모를 저장할 수 있습니다.')
+    if stage not in PENSION_LEAD_STAGES:
+        raise ValueError('영업상태 값이 올바르지 않습니다.')
+    if headcount is not None and _pension_int(headcount) is None:
+        raise ValueError('종업원 수는 1명 이상의 정수로 입력해 주세요.')
+    with get_db_connection() as conn:
+        conn.execute('''INSERT INTO pension_target_meta
+             (corp_code, employee_count, contact_stage, contact_note, updated_at)
+             VALUES (?,?,?,?,?) ON CONFLICT(corp_code) DO UPDATE SET
+             employee_count=excluded.employee_count,
+             contact_stage=excluded.contact_stage,
+             contact_note=excluded.contact_note,
+             updated_at=excluded.updated_at''',
+             (code, headcount, stage, str(note or '')[:2000], datetime.now().isoformat(timespec='seconds')))
+
+
+def _pension_target_import_headcount(upload, corp_master):
+    """일괄 입력은 8자리 DART 코드 또는 정확히 일치하는 유일한 법인명만 매칭."""
+    name = str(upload.name).lower()
+    raw = upload.getvalue()
+    if name.endswith('.xlsx'):
+        src = pd.read_excel(io.BytesIO(raw), dtype=str).fillna('')
+    elif name.endswith('.csv'):
+        last_error = None
+        for encoding in ('utf-8-sig', 'cp949', 'euc-kr'):
+            try:
+                src = pd.read_csv(io.BytesIO(raw), dtype=str, encoding=encoding).fillna('')
+                break
+            except Exception as exc:
+                last_error = exc
+        else:
+            raise ValueError(f'CSV 읽기 실패: {last_error}')
+    else:
+        raise ValueError('xlsx 또는 csv만 지원합니다.')
+    col_name = _find_external_column(src, ['법인명', '회사명', '업체명', '기업명'])
+    col_code = _find_external_column(src, ['DART고유번호', '고유번호', 'corp_code'])
+    col_count = _find_external_column(src, ['종업원수', '직원수', '근로자수', '상시근로자수', '임직원수', '인원'])
+    if not col_count or (not col_name and not col_code):
+        raise ValueError('법인명 또는 DART고유번호 열과 종업원수(직원수) 열이 필요합니다.')
+    by_name = {}
+    valid_codes = set()
+    for item in corp_master[['corp_code', 'corp_name']].fillna('').to_dict('records'):
+        code = str(item['corp_code'])
+        valid_codes.add(code)
+        by_name.setdefault(normalize_company_name(str(item['corp_name'])), set()).add(code)
+    to_save = {}
+    missed = 0
+    for item in src.to_dict('records'):
+        employees = _pension_int(item.get(col_count))
+        if employees is None:
+            missed += 1
+            continue
+        code = str(item.get(col_code) or '').strip() if col_code else ''
+        if re.fullmatch(r'\d{1,8}', code):
+            code = code.zfill(8)
+        if code not in valid_codes:
+            codes = by_name.get(normalize_company_name(str(item.get(col_name) or '')), set()) if col_name else set()
+            code = next(iter(codes)) if len(codes) == 1 else ''
+        if not code:
+            missed += 1
+            continue
+        to_save[code] = employees
+    return to_save, missed, len(src)
+
+
+def _pension_target_save_headcount(mapping):
+    now = datetime.now().isoformat(timespec='seconds')
+    with get_db_connection() as conn:
+        for code, count in mapping.items():
+            conn.execute('''INSERT INTO pension_target_meta
+               (corp_code, employee_count, contact_stage, contact_note, updated_at)
+               VALUES (?,?,'미접촉','',?) ON CONFLICT(corp_code) DO UPDATE SET
+               employee_count=excluded.employee_count,
+               updated_at=excluded.updated_at''', (code, count, now))
+
+
+def _pension_target_excel(df):
+    """화면 필터에 해당하는 목록과 작성 주의사항을 XLSX로 내보내기."""
+    buf = io.BytesIO()
+    out = df.drop(columns=['_rank'], errors='ignore').copy()
+    # 외부기업목록의 셀 문자열이 Excel 수식으로 실행되지 않도록 보호.
+    for col in out.select_dtypes(include=['object']).columns:
+        out[col] = out[col].map(lambda v: ("'" + v) if isinstance(v, str) and v.startswith(('=', '+', '@')) else v)
+    with pd.ExcelWriter(buf, engine='openpyxl') as writer:
+        out.to_excel(writer, sheet_name='퇴직연금_타깃', index=False)
+        pd.DataFrame([
+            ('자료 기준', '저장된 감사보고서 분석 + DART 정기보고서 직원현황 + 검증된 기업목록/수동 인원'),
+            ('직원 수 출처', 'DART 직원현황은 참고 수치로 상시근로자수 또는 퇴직연금 가입자 수를 의미하지 않음'),
+            ('판정 주의', '미도입 후보는 명시적 공시 문구에 따른 검토 대상이며 현재 미가입 확정이 아님'),
+            ('미분석', '기존 DART 공시 분석 결과가 없는 법인. 미도입 추정 금지'),
+            ('2028년 추진안', '100인 이상 사업장 (국회 법 개정 전)'),
+            ('2029년 추진안', '10~99인 사업장 (국회 법 개정 전)'),
+            ('2030년 추진안', '10인 미만 사업장 (국회 법 개정 전)'),
+            ('최초 발표', '고용노동부 2026-10-29'),
+            ('정책 원문', PENSION_POLICY_SOURCE),
+            ('개별 조회', 'DART 감사보고서 공시 접수일·가입 범위와 회사 현재 가입 여부 재확인 필요'),
+        ], columns=['구분', '설명']).to_excel(writer, sheet_name='판정_가이드', index=False)
+        for ws in writer.book.worksheets:
+            ws.freeze_panes = 'C2' if ws.title == '퇴직연금_타깃' else 'A2'
+            ws.auto_filter.ref = ws.dimensions
+            ws.row_dimensions[1].height = 25
+            from openpyxl.styles import Font, PatternFill, Alignment
+            for cell in ws[1]:
+                cell.fill = PatternFill('solid', fgColor='0B5045')
+                cell.font = Font(color='FFFFFF', bold=True)
+                cell.alignment = Alignment(vertical='center')
+            for col in ws.columns:
+                letter = col[0].column_letter
+                width = min(42, max(12, max(len(str(cell.value or '')) for cell in list(col)[:60]) + 2))
+                ws.column_dimensions[letter].width = width
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def render_pension_target_tab(corp_master):
+    st.subheader('🎯 퇴직연금 의무화 대응 · 신규 법인 타깃')
+    st.caption('기존 저장 결과에서 자동 선별 · 신규 DART 호출 없음 · 기존 법인 DB/분석 결과를 수정하지 않음')
+    st.info('2026.10.29 정부 발표 추진안: 2028년 100인 이상 → 2029년 10~99인 → 2030년 10인 미만. ' 
+            '법 개정 완료 전이므로 확정된 시행 의무로 안내하지 마세요. 시행 이후 근속분부터 적용 예정.')
+    st.link_button('고용노동부 공식 발표 확인', PENSION_POLICY_SOURCE)
+
+    ext = st.session_state.get('external_company_df')
+    df = _pension_target_load(corp_master, ext)
+    if df.empty:
+        st.warning('저장된 감사보고서 분석과 외부 기업목록이 없습니다. 먼저 법인을 분석하거나 지역 검색에서 외부 기업목록을 등록하세요.')
+        return
+
+    total_saved = int(df['출처'].str.contains('저장 분석', regex=False).sum())
+    cols = st.columns(4)
+    cols[0].metric('총 검토 법인', f'{len(df):,}개')
+    cols[1].metric('명시적 미운용 단서', f'{(df["대상유형"] == "미도입 후보").sum():,}개')
+    cols[2].metric('가입 여부 확인', f'{(df["대상유형"] == "가입 여부 확인").sum():,}개')
+    cols[3].metric('기존 분석 결과', f'{total_saved:,}개')
+
+    st.markdown('#### 👥 직원 수 자동조회 · DART 정기보고서')
+    report_count = int((df['인원출처'] == 'DART 정기보고서(참고)').sum())
+    known_count = int(df['종업원수'].notna().sum())
+    st.caption(f'현재 인원 확인 {known_count:,}/{len(df):,}개 법인 · DART 자동수집 {report_count:,}개. ' 
+               '이전 버전은 직원 수를 자동 조회하지 않았습니다. 이 버튼은 실제 DART API로 조회합니다.')
+    scope = st.selectbox('자동조회 범위', ['현재 타깃 중 미확인 법인', '전체 저장분석 중 미확인 법인'],
+                          key='pension_dart_employee_scope')
+    candidates = df[(df['DART고유번호'].str.fullmatch(r'\d{8}',na=False)) & (df['종업원수'].isna())]
+    if scope.startswith('현재 타깃'):
+        candidates = candidates[candidates['대상유형'].isin(['미도입 후보','가입 여부 확인','자료 부족','상충 근거'])]
+    checks = _pension_employee_recent_checks()
+    cutoff_missing = (datetime.now()-timedelta(days=30)).isoformat(timespec='seconds')
+    cutoff_errors = (datetime.now()-timedelta(days=1)).isoformat(timespec='seconds')
+    recent_codes={code for code,value in checks.items() if
+                  str(value.get('checked_at','')) >=
+                  (cutoff_missing if value.get('status') == '미공개' else cutoff_errors)}
+    candidates=candidates[~candidates['DART고유번호'].isin(recent_codes)].head(10)
+    already_checked=sum(1 for code in recent_codes if checks[code].get('status')!='확인')
+    st.caption(f'최근 30일 미공개·지난 24시간 오류로 중복 조회 제외 {already_checked}개 (개별 법인에서는 강제 갱신 가능)')
+    previous=st.session_state.pop('_pension_last_batch_result',None)
+    if previous:
+        st.success(previous)
+    if st.button(f'🌐 DART 직원현황 자동조회 (최대 {len(candidates)}개씩)',
+                 key='pension_employee_batch',disabled=(not dart_enabled or candidates.empty)):
+        successes=[]; no_data=[]; failures=[]
+        progress=st.progress(0,text='직원 현황 조회 중')
+        for idx,row in enumerate(candidates.to_dict('records')):
+            code=str(row['DART고유번호'])
+            try:
+                res=_pension_employee_lookup(api_key,code)
+                if res:
+                    _pension_employee_save(code,res)
+                    successes.append(f'{row["법인명"]} {res["employee_count"]:,}명')
+                else:
+                    no_data.append(row['법인명'])
+            except Exception as exc:
+                failures.append(f'{row["법인명"]}: {type(exc).__name__}')
+                _pension_employee_log(code,'조회 오류',type(exc).__name__)
+                # 네트워크 장애 시 나머지 법인 연쇄 재시도 방지
+                if _dart_cooldown_remaining():
+                    break
+            progress.progress((idx+1)/len(candidates),text=f'조회 {idx+1}/{len(candidates)}')
+        progress.empty()
+        if successes or no_data or failures:
+            pushed=_db_cloud_push()
+            if successes:
+                st.session_state['_pension_last_batch_result']=f'직원 수 확인 {len(successes)}개: '+', '.join(successes[:5])
+            if not pushed:
+                st.warning('로컬 저장 성공, Supabase 영구저장은 추가 확인 필요')
+        if no_data:
+            st.info('API에 직원현황 미공개 ('+str(len(no_data))+'개): '+', '.join(no_data[:7]))
+        if failures:
+            st.warning('조회 오류 ('+str(len(failures))+'개): '+', '.join(failures[:4]))
+        if successes:
+            st.rerun()
+    if not dart_enabled:
+        st.caption('DART API 키를 설정하고 오프라인 모드를 해제하면 자동조회 버튼이 활성화됩니다.')
+    st.caption('사업보고서·반기보고서 등을 제출하지 않는 법인은 인원 공개 데이터가 없을 수 있습니다. 해당 법인은 수동 입력 또는 확인된 기업목록을 사용하세요.')
+
+    with st.expander('👥 직원 수 엑셀/CSV 일괄 등록 (API 미공개 법인 보완)', expanded=False):
+        st.caption('기존 기업목록에 직원 수가 없으면 Excel/CSV로 보완합니다. 반드시 실제 확인된 인원만 입력하세요. ' 
+                   '직원 수가 없는 기업의 시행연도는 자동 추정하지 않습니다.')
+        example = pd.DataFrame([{'법인명': '예시회사', 'DART고유번호': '', '종업원수': 65}])
+        st.download_button('CSV 입력양식', data=example.to_csv(index=False).encode('utf-8-sig'),
+                           file_name='퇴직연금_직원수_입력양식.csv', mime='text/csv', key='pension_headcount_template')
+        upload = st.file_uploader('직원 수 자료 업로드', type=['xlsx', 'csv'], key='pension_headcount_upload')
+        if upload is not None:
+            try:
+                mapping, missed, total = _pension_target_import_headcount(upload, corp_master)
+                st.caption(f'총 {total}행 / DART 고유번호·법인명 매칭 {len(mapping)}개 / 매칭 불가·인원 무효 {missed}행 (중복 법인은 최종 값 적용)')
+                if mapping and st.button('✅ 확인된 직원 수 DB에 저장', key='pension_headcount_save'):
+                    _pension_target_save_headcount(mapping)
+                    if not _db_cloud_push():
+                        st.warning('로컬 DB에는 저장했지만 Supabase 동기화가 확인되지 않았습니다. DB 관리에서 영구저장을 재실행하세요.')
+                    st.success(f'{len(mapping)}개 법인의 직원 수 저장 완료')
+                    st.rerun()
+            except Exception as exc:
+                st.error(f'직원 수 파일 검증 오류: {exc}')
+
+    f1, f2, f3, f4 = st.columns([1.3, 1, 1, 1.3])
+    types = sorted(df['대상유형'].dropna().unique().tolist())
+    selected_types = f1.multiselect('분류 필터', types, default=[t for t in types if t in ('미도입 후보', '가입 여부 확인', '자료 부족', '미분석')],
+                                    key='pension_target_filter_type')
+    years = f2.selectbox('적용 예정연도', ['전체', '2028년', '2029년', '2030년', '인원 확인 필요'], key='pension_target_year')
+    stages = f3.selectbox('영업 진행상태', ['전체'] + PENSION_LEAD_STAGES, key='pension_target_stage')
+    name_filter = f4.text_input('법인명 / 소재지 검색', key='pension_target_search', placeholder='청주, 제조, 법인명 등')
+    view = df.copy()
+    if selected_types:
+        view = view[view['대상유형'].isin(selected_types)]
+    else:
+        view = view.iloc[:0]
+    if years != '전체':
+        view = view[view['시행예정'].str.startswith(years)]
+    if stages != '전체':
+        view = view[view['영업상태'] == stages]
+    if name_filter:
+        search = str(name_filter).strip()
+        view = view[view['법인명'].str.contains(search, case=False, regex=False, na=False) |
+                    view['주소'].str.contains(search, case=False, regex=False, na=False)]
+    st.caption(f'현재 필터 결과: {len(view):,}개. 미분석·기존 운영 법인도 보고 싶으면 **분류 필터**에서 선택하세요.')
+    shown_cols = ['법인명', '주소', '종업원수', '인원출처', '인원공시기준', '시행예정', '대상유형', '판별근거', '영업상태', '접수일', '분석저장일', '출처']
+    st.dataframe(view[shown_cols], use_container_width=True, hide_index=True, height=425)
+    st.download_button('📥 현재 조건의 타깃 법인 Excel 다운로드', data=_pension_target_excel(view),
+                       file_name='CorporateFinder_퇴직연금_영업타깃.xlsx',
+                       mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                       key='pension_targets_excel', disabled=view.empty)
+
+    if not view.empty:
+        st.markdown('#### 📋 법인별 공시 근거 및 영업 진행 기록')
+        choices = [f'{row["법인명"]} · {row["DART고유번호"] or "매칭 필요"}'
+                   for row in view.to_dict('records')]
+        picked = st.selectbox('법인 선택', range(len(choices)), format_func=lambda x: choices[x], key='pension_selected')
+        r = view.iloc[picked]
+        st.write(f'**{r["대상유형"]}** | {r["판별근거"]}')
+        st.write(f'**제안 방향:** {r["영업제안"]}')
+        if r['DART원문'] and str(r['DART원문']).startswith('https://dart.fss.or.kr/'):
+            st.link_button('해당 감사보고서 원문 확인', r['DART원문'])
+        code = str(r['DART고유번호'])
+        if code:
+            with get_db_connection() as conn:
+                item = conn.execute('SELECT result_json FROM company_analysis WHERE corp_code=?', (code,)).fetchone()
+            if item:
+                try:
+                    pen = (json.loads(item['result_json']).get('pension') or {})
+                    op = pen.get('운영근거') or {}
+                    with st.expander('명시적 운영/미운용 판별 원문', expanded=False):
+                        for key in ('미운용', 'DB', 'DC'):
+                            evid = op.get(key) or []
+                            if evid:
+                                st.markdown(f'**{key} ({len(evid)}건)**')
+                                for line in evid[:4]:
+                                    st.info(str(line))
+                except (ValueError, TypeError):
+                    pass
+            with st.form('pension_target_contact_form'):
+                count_value = r['종업원수']
+                st.caption('직원 수는 수동으로 검증 후 등록 (퇴직연금 도입 여부 판별값과 별도)')
+                count_text = st.text_input('확인된 종업원 수 (모르면 공란)', value='' if pd.isna(count_value) else str(int(count_value)))
+                current_stage = str(r['영업상태'])
+                current_stage = current_stage if current_stage in PENSION_LEAD_STAGES else '미접촉'
+                stage = st.selectbox('영업 진행상태', PENSION_LEAD_STAGES,
+                                     index=PENSION_LEAD_STAGES.index(current_stage))
+                note = st.text_area('상담메모', value=str(r['상담메모']), height=90)
+                if st.form_submit_button('💾 영업정보 저장', type='primary'):
+                    try:
+                        headcount = _pension_int(count_text)
+                        if count_text.strip() and headcount is None:
+                            raise ValueError('종업원 수는 정확한 정수만 입력해 주세요.')
+                        _pension_target_save(code, headcount=headcount, stage=stage, note=note)
+                        if not _db_cloud_push():
+                            st.warning('로컬 DB 저장 완료. Supabase 동기화는 실패/미설정 상태이므로 DB 관리에서 별도 확인하세요.')
+                        st.success('영업 진행상태·직원 수·메모를 저장했습니다.')
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f'저장 실패: {exc}')
+        else:
+            st.warning('동명 또는 미매칭 법인입니다. DART 법인을 정확히 선택한 후 저장할 수 있습니다.')
+    st.caption('※ 직원 현황은 공시 기준 참고 인원으로 실제 상시근로자 수와 다를 수 있습니다. 이 탭의 분류는 영업 검토 보조용이며 가입 여부, 기존 연금사업자, 퇴직급여채무 금액, 법정 적립률을 확정하지 않습니다.')
+
 # LOGIN — MATCHES HANAV ETF FINDER
 # =========================================================
 st.markdown("""
@@ -2760,8 +3576,8 @@ if not dart_enabled:
 # =========================================================
 # UI
 # =========================================================
-name_tab, region_tab, bulk_tab, db_tab = st.tabs([
-    "🔎 법인명 조회", "📍 본점 소재지 검색", "📚 여러 법인 일괄 조회", "🗄️ 주소 DB 관리"
+name_tab, region_tab, pension_target_tab, bulk_tab, db_tab = st.tabs([
+    "🔎 법인명 조회", "📍 본점 소재지 검색", "🎯 퇴직연금 타깃", "📚 여러 법인 일괄 조회", "🗄️ 주소 DB 관리"
 ])
 
 
@@ -2811,6 +3627,22 @@ with name_tab:
                     with st.spinner("저장 결과 확인 또는 DART 감사보고서 분석 중입니다..."):
                         result = analyze_company(api_key, selected, refresh=_name_refresh)
                     st.session_state["single_result"] = result
+                    if dart_enabled and result.get('report') and not _pension_employee_saved(selected['corp_code']):
+                        _prior=_pension_employee_recent_checks().get(str(selected['corp_code']))
+                        _recent=bool(_prior and str(_prior.get('checked_at','')) >=
+                            (datetime.now()-timedelta(days=30 if _prior.get('status')=='미공개' else 1)).isoformat(timespec='seconds'))
+                        if not _recent:
+                            try:
+                                with st.spinner('DART 정기보고서 직원현황 추가 조회 중...'):
+                                    _record=_pension_employee_lookup(api_key,selected['corp_code'])
+                                if _record:
+                                    _pension_employee_save(selected['corp_code'],_record)
+                                    _db_cloud_push()
+                                else:
+                                    st.caption('직원 현황: DART 정기보고서 데이터 미공개. 타깃 탭에서 수동 확인 가능')
+                            except Exception as _err:
+                                _pension_employee_log(selected_corp['corp_code'],'조회 오류',type(_err).__name__)
+                                st.caption(f'직원 수 추가 조회 불가 ({type(_err).__name__}), 감사보고서 분석은 정상 표시됩니다.')
                 except Exception as e:
                     st.error(f"분석 중 오류: {e}")
 
@@ -2845,6 +3677,7 @@ with name_tab:
             st.warning("감사보고서 원문에서 등록된 은행명을 찾지 못했습니다.")
 
         if r:
+            _render_pension_employee_section(str(c.get('DART고유번호') or ''),api_key,dart_enabled,key='single_pension')
             render_pension_analysis(result.get("pension") or analyze_pension_text(""))
 
         generic = result.get("generic", [])
@@ -3099,6 +3932,21 @@ with region_tab:
                         with st.spinner("저장 결과 확인 또는 DART 감사보고서 분석 중입니다..."):
                             result = analyze_company(api_key, selected_corp, refresh=_rg_refresh)
                         st.session_state["region_analysis_result"] = result
+                        if dart_enabled and result.get('report') and not _pension_employee_saved(selected_corp['corp_code']):
+                            _prior=_pension_employee_recent_checks().get(str(selected_corp['corp_code']))
+                            _recent=bool(_prior and str(_prior.get('checked_at','')) >=
+                                (datetime.now()-timedelta(days=30 if _prior.get('status')=='미공개' else 1)).isoformat(timespec='seconds'))
+                            if not _recent:
+                                try:
+                                    with st.spinner('DART 정기보고서 직원현황 추가 조회 중...'):
+                                        _record=_pension_employee_lookup(api_key,selected_corp['corp_code'])
+                                    if _record:
+                                        _pension_employee_save(selected_corp['corp_code'],_record)
+                                        _db_cloud_push()
+                                    else:
+                                        st.caption('직원 현황: DART 정기보고서 데이터 미공개. 타깃 탭에서 수동 확인 가능')
+                                except Exception as _err:
+                                    st.caption(f'직원 수 추가 조회 불가 ({type(_err).__name__}), 감사보고서 분석은 정상 표시됩니다.')
                     except Exception as e:
                         st.error(f"분석 중 오류: {e}")
                 if _rg_diagnose:
@@ -3148,6 +3996,8 @@ with region_tab:
                 st.warning(rr["error"])
 
             if r:
+                _render_pension_employee_section(str(c.get('DART고유번호') or ''),api_key,dart_enabled,
+                    external_count=(picked.get('종업원수') if picked else None),key='region_pension')
                 render_pension_analysis(rr.get("pension") or analyze_pension_text(""))
 
             generic = rr.get("generic", [])
@@ -3193,6 +4043,10 @@ with region_tab:
                 "조건에 맞는 회사를 찾지 못했습니다. DART 주소 DB가 일부만 구축된 경우 결과가 누락될 수 있으므로 "
                 "주소 DB를 더 구축하거나 외부 기업목록을 함께 사용해 주세요."
             )
+
+
+with pension_target_tab:
+    render_pension_target_tab(corp_df)
 
 
 with bulk_tab:
