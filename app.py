@@ -3504,6 +3504,19 @@ def _corp_db_admin_password():
     return str(get_secret('ADMIN_PASSWORD', '') or get_secret('APP_PASSWORD', '') or '')
 
 
+def _corp_admin_clear_pending():
+    """관리자 인증창 X/ESC/바깥 클릭 또는 취소 시 미승인 작업을 폐기."""
+    st.session_state.pop('_corp_admin_pending_action', None)
+    st.session_state.pop('_corp_admin_approved_action', None)
+    st.session_state.pop('_corp_pending_contact_payload', None)
+
+
+# 구버전에서 닫힌 창의 보류 상태가 남았을 수 있으므로 최초 1회 초기화한다.
+if st.session_state.get('_corp_admin_dialog_revision') != '20261030-dismiss-fix':
+    _corp_admin_clear_pending()
+    st.session_state['_corp_admin_dialog_revision'] = '20261030-dismiss-fix'
+
+
 def _corp_admin_action_approved(action_key):
     if st.session_state.get('_corp_admin_approved_action') == action_key:
         st.session_state.pop('_corp_admin_approved_action', None)
@@ -3519,7 +3532,7 @@ def _corp_admin_button(label, *, key, container=None, **kwargs):
     return _corp_admin_action_approved(key)
 
 
-@st.dialog('🔐 관리자 비밀번호 확인')
+@st.dialog('🔐 관리자 비밀번호 확인', on_dismiss=_corp_admin_clear_pending)
 def _corp_admin_confirm_dialog():
     action_key = st.session_state.get('_corp_admin_pending_action')
     if not action_key:
@@ -3529,8 +3542,7 @@ def _corp_admin_confirm_dialog():
     if not expected:
         st.error('관리자 비밀번호를 확인할 수 없습니다. Streamlit Secrets의 APP_PASSWORD 또는 ADMIN_PASSWORD 설정을 확인해 주세요.')
         if st.button('닫기', key='_corp_admin_no_password_close'):
-            st.session_state.pop('_corp_admin_pending_action', None)
-            st.session_state.pop('_corp_pending_contact_payload', None)
+            _corp_admin_clear_pending()
             st.rerun()
         return
     blocked_until = float(st.session_state.get('_corp_admin_blocked_until', 0))
@@ -3554,8 +3566,7 @@ def _corp_admin_confirm_dialog():
                     st.session_state['_corp_admin_failures'] = 0
                 st.error('관리자 비밀번호가 일치하지 않습니다.')
     if st.button('취소', key='_corp_admin_cancel'):
-        st.session_state.pop('_corp_admin_pending_action', None)
-        st.session_state.pop('_corp_pending_contact_payload', None)
+        _corp_admin_clear_pending()
         st.rerun()
 
 
@@ -3632,7 +3643,10 @@ st.markdown("""
     color: #142b50; margin: 0 0 10px;
 }
 .cf-brand-title span {
+    display: inline-block; white-space: nowrap;
     font-style: italic; font-weight: 820; letter-spacing: -.045em;
+    /* Italic glyphs overhang the final letter; keep extra paint width. */
+    padding-right: .23em; margin-right: -.13em;
     background: linear-gradient(100deg, #2457de 5%, #119fd4 93%);
     -webkit-background-clip: text; background-clip: text; color: transparent;
 }
