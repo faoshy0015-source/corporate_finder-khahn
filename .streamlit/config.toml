@@ -1,0 +1,9 @@
+# HanaV shared light theme — design preview branch only.
+# Existing application calculations, persistence, and authentication unchanged.
+[theme]
+base = "light"
+primaryColor = "#08796F"
+backgroundColor = "#F5F9F8"
+secondaryBackgroundColor = "#EAF4F0"
+textColor = "#263C3A"
+font = "sans serif"
