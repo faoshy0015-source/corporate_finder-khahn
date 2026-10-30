@@ -3,6 +3,7 @@ import io
 import os
 import json
 import hmac
+import hashlib
 import tempfile
 import html
 import re
@@ -1705,6 +1706,38 @@ def read_external_company_file(uploaded_file):
     mapped_with_meta = dict(mapped)
     mapped_with_meta["__파일인식정보__"] = read_meta
     return out, mapped_with_meta
+
+def merge_external_company_rows(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame:
+    """기존 외부 기업목록을 유지하며 신규 회사/사업장만 추가한다.
+
+    동일 법인명이라도 사업장 소재지가 다르면 별도 행으로 보존한다.
+    기존에 저장된 행은 수정하거나 삭제하지 않는다.
+    """
+    if incoming is None or incoming.empty:
+        return existing.copy() if isinstance(existing, pd.DataFrame) else pd.DataFrame()
+
+    current = existing.copy() if isinstance(existing, pd.DataFrame) else pd.DataFrame()
+    cols = list(dict.fromkeys([*current.columns, *incoming.columns]))
+    current = current.reindex(columns=cols, fill_value="").fillna("")
+    additions = incoming.reindex(columns=cols, fill_value="").fillna("")
+
+    def make_keys(df: pd.DataFrame) -> pd.Series:
+        names = df["norm_name"].astype(str).str.strip().str.lower()
+        locations = (
+            df["검색주소"].astype(str)
+            .str.replace(r"\s+", "", regex=True).str.lower()
+        )
+        return names + "|" + locations
+
+    incoming_keys = make_keys(additions)
+    known_keys = set(make_keys(current)) if not current.empty else set()
+    unique_new = additions.loc[
+        ~incoming_keys.isin(known_keys) & ~incoming_keys.duplicated()
+    ]
+    if unique_new.empty:
+        return current
+    return pd.concat([current, unique_new], ignore_index=True)
+
 
 def filter_external_by_region(df: pd.DataFrame, terms, name_query="", limit=3000):
     if df is None or df.empty:
@@ -3556,7 +3589,6 @@ if 'external_company_df' not in st.session_state:
         if not _saved_external.empty:
             st.session_state['external_company_df'] = _saved_external
             st.session_state['external_mapped_cols'] = _saved_columns
-            st.session_state['external_file_sig'] = 'saved-db'
     except Exception as _ext_exc:
         st.warning(f'저장된 외부 기업목록 불러오기 실패: {_ext_exc}')
 
@@ -3763,32 +3795,77 @@ with region_tab:
         )
 
     if source_mode in ("외부 기업목록", "둘 다"):
-        uploaded = st.file_uploader(
-            "기업목록 CSV / Excel",
+        uploaded_files = st.file_uploader(
+            "기업목록 CSV / Excel (여러 파일 추가 가능)",
             type=["csv", "xlsx", "xls"],
-            key="external_company_file",
-            help="회사명과 주소가 들어 있는 파일이면 대부분 자동으로 열을 인식합니다.",
+            accept_multiple_files=True,
+            key="external_company_files_multi",
+            help="여러 파일을 한 번에 선택하거나 + 버튼으로 추가할 수 있습니다. 기존 DB 목록은 삭제되지 않습니다.",
         )
-        if uploaded is not None:
-            file_sig = f"{uploaded.name}:{uploaded.size}"
-            if st.session_state.get("external_file_sig") != file_sig:
-                try:
-                    ext_df, mapped = read_external_company_file(uploaded)
-                    save_external_company_db(ext_df, mapped)
-                    st.session_state["external_company_df"] = ext_df
-                    st.session_state["external_file_sig"] = file_sig
-                    st.session_state["external_mapped_cols"] = mapped
-                except Exception as e:
-                    st.error(f"외부 기업목록 읽기 실패: {e}")
-            if "external_company_df" in st.session_state:
-                st.success(f"외부 기업목록 {len(st.session_state['external_company_df']):,}개 불러옴 · SQLite 자동 저장")
-                with st.expander("인식된 열 확인"):
-                    st.json(st.session_state.get("external_mapped_cols", {}))
+        st.caption("새 파일을 추가하면 기존 목록에 누적 저장합니다. 법인명과 사업장 주소가 같은 행은 중복 추가하지 않습니다.")
 
-        if uploaded is None and isinstance(st.session_state.get('external_company_df'), pd.DataFrame):
-            _ext_df = st.session_state['external_company_df']
-            if not _ext_df.empty:
-                st.success(f'💾 마지막으로 저장한 외부 기업목록 {_ext_df.shape[0]:,}개 자동 불러옴 · 파일 재업로드 불필요')
+        if uploaded_files:
+            already_processed = set(st.session_state.get("external_uploaded_hashes", []))
+            old_df = st.session_state.get("external_company_df")
+            merged_df = old_df.copy() if isinstance(old_df, pd.DataFrame) else pd.DataFrame()
+            saved_mapping = dict(st.session_state.get("external_mapped_cols", {}))
+            stored_info = saved_mapping.get("__파일인식정보__", [])
+            history = ([stored_info] if isinstance(stored_info, dict)
+                       else list(stored_info) if isinstance(stored_info, list) else [])
+            added_total, skipped_total = 0, 0
+            completed_hashes = []
+
+            for external_upload in uploaded_files:
+                file_hash = hashlib.sha256(external_upload.getvalue()).hexdigest()
+                if file_hash in already_processed or file_hash in completed_hashes:
+                    continue
+                try:
+                    imported_df, mapped = read_external_company_file(external_upload)
+                    previous_count = len(merged_df)
+                    merged_df = merge_external_company_rows(merged_df, imported_df)
+                    added = len(merged_df) - previous_count
+                    added_total += added
+                    skipped_total += len(imported_df) - added
+                    if added:
+                        saved_mapping.update({k: v for k, v in mapped.items() if k != "__파일인식정보__"})
+                        info = dict(mapped.get("__파일인식정보__", {}))
+                        info["추가건수"] = added
+                        history.append(info)
+                    completed_hashes.append(file_hash)
+                except Exception as e:
+                    st.error(f"'{external_upload.name}' 읽기 실패 (기존 자료 유지): {e}")
+
+            if completed_hashes:
+                if added_total:
+                    saved_mapping["__파일인식정보__"] = history
+                    try:
+                        # 누적 결합본을 한 번만 저장하여 부분 덮어쓰기를 방지한다.
+                        save_external_company_db(merged_df, saved_mapping)
+                    except Exception as e:
+                        st.error(f"외부 기업목록 누적 저장 실패 (기존 저장본 유지): {e}")
+                    else:
+                        st.session_state["external_company_df"] = merged_df
+                        st.session_state["external_mapped_cols"] = saved_mapping
+                        st.session_state["external_uploaded_hashes"] = list(
+                            already_processed.union(completed_hashes)
+                        )
+                        st.success(
+                            f"신규 {added_total:,}건 추가 · 중복 {skipped_total:,}건 제외 "
+                            f"· 누적 {len(merged_df):,}건 SQLite 저장 완료"
+                        )
+                        if st.session_state.get("_db_cloud_error"):
+                            st.warning("Supabase 클라우드 백업이 실패했습니다. '현재 DB 영구 저장'에서 재시도해 주세요.")
+                else:
+                    st.session_state["external_uploaded_hashes"] = list(
+                        already_processed.union(completed_hashes)
+                    )
+                    st.info(f"중복 {skipped_total:,}건 확인 · 기존 저장 목록을 그대로 유지했습니다.")
+
+        saved_ext = st.session_state.get("external_company_df")
+        if isinstance(saved_ext, pd.DataFrame) and not saved_ext.empty:
+            st.success(f"💾 저장된 외부 기업목록 누적 {len(saved_ext):,}건 · 파일 재업로드 불필요")
+            with st.expander("업로드 파일 및 인식된 열 확인"):
+                st.json(st.session_state.get("external_mapped_cols", {}))
 
         st.link_button(
             "📥 2025 충청북도 제조업체 총람 다운로드 페이지",
