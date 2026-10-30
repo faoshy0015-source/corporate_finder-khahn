@@ -3876,15 +3876,28 @@ with region_tab:
         )
 
     if source_mode in ("외부 기업목록", "둘 다"):
-        uploaded_files = st.file_uploader(
-            "기업목록 CSV / Excel (여러 파일 추가 가능)",
-            type=["csv", "xlsx", "xls"],
-            accept_multiple_files=True,
-            key="external_company_files_multi",
-            help="여러 파일을 한 번에 선택하거나 + 버튼으로 추가할 수 있습니다. 기존 DB 목록은 삭제되지 않습니다.",
-        )
-        st.caption("추가할 파일을 선택하고 '누적 저장'을 누른 뒤 관리자 비밀번호를 입력하세요. 기존 목록을 유지하며 중복 행을 제외합니다.")
-
+        upload_unlocked = time.monotonic() < float(st.session_state.get("_external_upload_access_expires", 0))
+        if not upload_unlocked:
+            if _corp_admin_button("🔐 관리자 인증 후 기업목록 파일 선택", key="external_upload_unlock"):
+                st.session_state["_external_upload_access_expires"] = time.monotonic() + 15 * 60
+                upload_unlocked = True
+        uploaded_files = []
+        if upload_unlocked:
+            if st.button("🔒 기업목록 업로드 닫기", key="external_upload_close"):
+                st.session_state.pop("_external_upload_access_expires", None)
+                st.session_state.pop("external_company_files_multi", None)
+                st.rerun()
+            st.caption("관리자 인증 완료 · 15분간 파일 선택 가능. 실제 DB 저장 시 비밀번호를 다시 확인합니다.")
+            uploaded_files = st.file_uploader(
+                "기업목록 CSV / Excel (여러 파일 추가 가능)",
+                type=["csv", "xlsx", "xls"],
+                accept_multiple_files=True,
+                key="external_company_files_multi",
+                help="여러 파일을 한 번에 선택하거나 + 버튼으로 추가할 수 있습니다. 기존 DB 목록은 삭제되지 않습니다.",
+            )
+            st.caption("기존 기업목록에 신규 파일만 누적합니다. 법인명과 사업장 주소가 같은 행은 중복 제외합니다.")
+        else:
+            st.caption("기존 목록 조회는 가능하며, 기업목록 파일 추가는 관리자 인증 후에만 가능합니다.")
         if uploaded_files:
             st.caption(f"선택한 파일 {len(uploaded_files):,}개 · 관리자 인증 후 DB에 반영됩니다.")
             if _corp_admin_button("🔐 선택 파일을 기존 DB에 누적 저장", type="primary",
