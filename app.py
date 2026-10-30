@@ -3588,8 +3588,111 @@ if not st.session_state['_corp_authenticated']:
 _, _logout_col=st.columns([5,1])
 with _logout_col:
     st.button('🔒 로그아웃',key='_corp_logout_btn',use_container_width=True,on_click=_corp_logout)
-st.title('🏢 Corporate Finder')
-st.caption('법인명·본점 소재지 검색 · 감사보고서 거래은행/퇴직연금 · 마지막 DB 자동 복원')
+# Corporate Finder · Modern Fintech (선택 시안 2) — 헤더에만 디자인 적용
+st.markdown("""
+<style>
+.cf-brand-header {
+    position: relative; isolation: isolate; overflow: hidden;
+    display: flex; align-items: center; gap: 26px;
+    min-height: 164px; padding: 23px 31px;
+    margin: 2px 0 22px 0; border-radius: 22px;
+    border: 1px solid rgba(115, 187, 230, .26);
+    background: linear-gradient(110deg, #f0f9ff 0%, #f8fcff 53%, #eaf6ff 100%);
+    box-shadow: 0 10px 32px rgba(30, 82, 143, .055);
+}
+.cf-brand-header::before {
+    content: ""; position: absolute; z-index: -1; inset: 0;
+    background:
+        radial-gradient(ellipse at 90% 12%, rgba(87, 190, 255, .20), transparent 35%),
+        radial-gradient(ellipse at 8% 85%, rgba(43, 205, 208, .11), transparent 32%);
+    pointer-events: none;
+}
+.cf-brand-header::after {
+    content: ""; position: absolute; z-index: -1;
+    width: 350px; height: 210px; right: -48px; top: -100px;
+    border: 2px solid rgba(111, 205, 255, .22);
+    transform: rotate(-21deg); border-radius: 50%;
+    pointer-events: none;
+}
+.cf-brand-icon {
+    position: relative; z-index: 1; flex: 0 0 114px;
+    width: 114px; height: 114px; display: flex;
+    align-items: center; justify-content: center;
+    border-radius: 24px;
+    background: linear-gradient(140deg, rgba(255,255,255,.94), rgba(200,236,255,.62));
+    border: 1px solid rgba(255,255,255,.97);
+    box-shadow: 0 7px 24px rgba(36,135,206,.13), inset 0 0 0 1px rgba(123,210,255,.27);
+}
+.cf-brand-icon svg { width: 100px; height: 100px; display: block; }
+.cf-brand-copy { position: relative; z-index: 1; min-width: 0; }
+.cf-brand-title {
+    font-family: "Inter", "Pretendard", "Noto Sans KR", sans-serif;
+    font-size: clamp(30px, 3.6vw, 49px);
+    font-weight: 830; line-height: 1.12; letter-spacing: -.052em;
+    color: #142b50; margin: 0 0 10px;
+}
+.cf-brand-title span {
+    font-style: italic; font-weight: 820; letter-spacing: -.045em;
+    background: linear-gradient(100deg, #2457de 5%, #119fd4 93%);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+.cf-brand-desc {
+    font-size: clamp(12px, 1.1vw, 15px); font-weight: 500;
+    color: #65798e; letter-spacing: -.015em; line-height: 1.5;
+}
+.cf-brand-decoration {
+    position: absolute; width: 200px; height: 120px; right: 46px; bottom: 6px;
+    opacity: .12; z-index: 0; pointer-events: none;
+    background: repeating-linear-gradient(90deg, transparent 0 18px, #55a7de 18px 22px, transparent 22px 35px);
+    clip-path: polygon(12% 38%, 37% 38%, 37% 4%, 63% 4%, 63% 29%, 85% 29%, 85% 100%, 12% 100%);
+}
+@media (max-width: 640px) {
+    .cf-brand-header { gap: 13px; min-height: 116px; padding: 15px 14px; border-radius: 16px; margin-bottom: 16px; }
+    .cf-brand-icon { width: 74px; height: 74px; flex-basis: 74px; border-radius: 16px; }
+    .cf-brand-icon svg { width: 67px; height: 67px; }
+    .cf-brand-title { font-size: clamp(23px, 6vw, 32px); margin-bottom: 6px; }
+    .cf-brand-desc { font-size: 11px; }
+    .cf-brand-decoration { display: none; }
+}
+</style>
+<div class="cf-brand-header">
+  <div class="cf-brand-icon" aria-hidden="true">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 112 112">
+      <defs>
+        <linearGradient id="cf-tower-one" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stop-color="#5cdfff"/><stop offset="1" stop-color="#1688dc"/>
+        </linearGradient>
+        <linearGradient id="cf-tower-two" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stop-color="#174d9c"/><stop offset="1" stop-color="#092e68"/>
+        </linearGradient>
+        <linearGradient id="cf-search-lens" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stop-color="#79efff"/><stop offset="1" stop-color="#1496e6"/>
+        </linearGradient>
+        <filter id="cf-logo-shadow" x="-30%" y="-30%" width="170%" height="170%">
+          <feDropShadow dx="1" dy="3" stdDeviation="2.5" flood-color="#1e6dac" flood-opacity=".23"/>
+        </filter>
+      </defs>
+      <g filter="url(#cf-logo-shadow)">
+        <path d="M15 38 43 26 43 93 15 93Z" fill="url(#cf-tower-one)"/>
+        <path d="M43 16 73 5 73 93 43 93Z" fill="url(#cf-tower-two)"/>
+        <path d="M73 25 90 34 90 93 73 93Z" fill="#51d9ef"/>
+        <path d="M20 46 36 40 M20 57 36 51 M20 68 36 62 M20 79 36 73" stroke="#e5fbff" stroke-width="4" opacity=".88"/>
+        <path d="M51 29 65 24 M51 42 65 37 M51 55 65 50 M51 68 65 63" stroke="#82eaff" stroke-width="4" opacity=".83"/>
+        <path d="M78 41 85 44 M78 53 85 56 M78 65 85 68" stroke="#e8ffff" stroke-width="3"/>
+      </g>
+      <circle cx="74" cy="70" r="23" fill="#ebfbff" fill-opacity=".94" stroke="url(#cf-search-lens)" stroke-width="9"/>
+      <path d="M90 87 105 103" stroke="#1b5ea5" stroke-width="10" stroke-linecap="round"/>
+      <path d="M90 87 105 103" stroke="#37cbea" stroke-width="4" stroke-linecap="round" opacity=".85"/>
+      <path d="M63 59q9-9 20-3" fill="none" stroke="#ffffff" stroke-width="3" stroke-linecap="round" opacity=".73"/>
+    </svg>
+  </div>
+  <div class="cf-brand-copy">
+    <div class="cf-brand-title">Corporate <span>Finder</span></div>
+    <div class="cf-brand-desc">법인명·본점 소재지 검색 · 감사보고서 거래은행/퇴직연금 · 마지막 DB 자동 복원</div>
+  </div>
+  <div class="cf-brand-decoration" aria-hidden="true"></div>
+</div>
+""", unsafe_allow_html=True)
 if not _corp_db_admin_password():
     st.warning('🔐 관리자 비밀번호 설정을 찾을 수 없습니다. APP_PASSWORD 또는 ADMIN_PASSWORD를 확인해 주세요.')
 
@@ -3739,9 +3842,9 @@ with name_tab:
 
             _name_c1, _name_c2 = st.columns([2, 1])
             with _name_c1:
-                _name_run = _corp_admin_button("거래은행 + 퇴직연금 통합 분석", type="primary", key="single_analyze")
+                _name_run = st.button("거래은행 + 퇴직연금 통합 분석", type="primary", key="single_analyze")
             with _name_c2:
-                _name_refresh = _corp_admin_button("🔄 최신 공시 재분석", key="single_analyze_refresh", disabled=not dart_enabled)
+                _name_refresh = st.button("🔄 최신 공시 재분석", key="single_analyze_refresh", disabled=not dart_enabled)
             if _name_run or _name_refresh:
                 try:
                     with st.spinner("저장 결과 확인 또는 DART 감사보고서 분석 중입니다..."):
@@ -4096,9 +4199,9 @@ with region_tab:
                 st.info("이 회사를 선택하면 감사보고서에서 거래은행·금융거래 근거와 퇴직연금 관련 공시를 함께 분석합니다.")
                 _rg_c1, _rg_c2, _rg_c3 = st.columns([2.2, 1.2, 1.1])
                 with _rg_c1:
-                    _rg_run = _corp_admin_button("🏦 거래은행 · 차입금 · 퇴직연금 분석", type="primary", key="region_analyze_btn")
+                    _rg_run = st.button("🏦 거래은행 · 차입금 · 퇴직연금 분석", type="primary", key="region_analyze_btn")
                 with _rg_c2:
-                    _rg_refresh = _corp_admin_button("🔄 최신 공시 재분석", key="region_analyze_refresh", disabled=not dart_enabled)
+                    _rg_refresh = st.button("🔄 최신 공시 재분석", key="region_analyze_refresh", disabled=not dart_enabled)
                 with _rg_c3:
                     _rg_diagnose = st.button("🔌 DART 연결 진단", key="region_dart_diagnose", disabled=not dart_enabled)
                 if _rg_run or _rg_refresh:
@@ -4232,7 +4335,7 @@ with bulk_tab:
     )
     st.caption("한 번에 최대 20개 법인을 권장합니다.")
 
-    if _corp_admin_button("일괄 분석 시작", type="primary", key="bulk_analyze"):
+    if st.button("일괄 분석 시작", type="primary", key="bulk_analyze"):
         names = [x.strip() for x in bulk_text.splitlines() if x.strip()]
         names = list(dict.fromkeys(names))[:20]
 
