@@ -3537,7 +3537,7 @@ def _corp_admin_confirm_dialog():
         st.error('비밀번호를 여러 번 잘못 입력했습니다. 잠시 후 다시 시도해 주세요.')
     else:
         with st.form('_corp_admin_password_form', clear_on_submit=True):
-            entered = st.text_input('관리자 비밀번호', type='password', autocomplete='off')
+            entered = st.text_input('관리자 비밀번호', type='password')
             confirmed = st.form_submit_button('인증 후 실행', type='primary')
         if confirmed:
             if hmac.compare_digest(entered.encode('utf-8'), expected.encode('utf-8')):
