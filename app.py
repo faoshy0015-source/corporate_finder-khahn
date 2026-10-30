@@ -1241,10 +1241,10 @@ def _db_cloud_indicator():
             st.caption('마지막 클라우드 백업: ' + st.session_state['_db_cloud_saved_at'])
         sync_left, sync_right = st.columns(2)
         with sync_left:
-            if st.button('☁️ 현재 DB 영구 저장 (압축)', key='corp_cloud_save_btn'):
+            if _corp_admin_button('☁️ 현재 DB 영구 저장 (압축)', key='corp_cloud_save_btn'):
                 _db_cloud_push(show_feedback=True)
         with sync_right:
-            if st.button('📥 PC 최신 분석·영업정보 가져오기', key='corp_cloud_pull_analysis_btn'):
+            if _corp_admin_button('📥 PC 최신 분석·영업정보 가져오기', key='corp_cloud_pull_analysis_btn'):
                 try:
                     with st.spinner('Supabase DB에서 PC가 분석한 결과를 확인하고 병합하는 중입니다...'):
                         count = _db_cloud_merge_analysis_from_remote()
@@ -2997,7 +2997,7 @@ def _render_pension_employee_section(corp_code, api_key, enabled, external_count
     if recent and not dart_row and number is None:
         st.caption(f'DART 조회기록: {recent["status"]} · {recent["checked_at"][:10]} (새로 조회하려면 아래 버튼)')
     if enabled:
-        if st.button('🔎 DART 직원현황 조회·갱신',key=key+'_emp_refresh'):
+        if _corp_admin_button('🔎 DART 직원현황 조회·갱신',key=key+'_emp_refresh'):
             try:
                 with st.spinner('최신 정기보고서의 직원현황을 확인하고 있습니다...'):
                     record=_pension_employee_lookup(api_key,str(corp_code))
@@ -3324,7 +3324,7 @@ def render_pension_target_tab(corp_master):
     previous=st.session_state.pop('_pension_last_batch_result',None)
     if previous:
         st.success(previous)
-    if st.button(f'🌐 DART 직원현황 자동조회 (최대 {len(candidates)}개씩)',
+    if _corp_admin_button(f'🌐 DART 직원현황 자동조회 (최대 {len(candidates)}개씩)',
                  key='pension_employee_batch',disabled=(not dart_enabled or candidates.empty)):
         successes=[]; no_data=[]; failures=[]
         progress=st.progress(0,text='직원 현황 조회 중')
@@ -3372,7 +3372,7 @@ def render_pension_target_tab(corp_master):
             try:
                 mapping, missed, total = _pension_target_import_headcount(upload, corp_master)
                 st.caption(f'총 {total}행 / DART 고유번호·법인명 매칭 {len(mapping)}개 / 매칭 불가·인원 무효 {missed}행 (중복 법인은 최종 값 적용)')
-                if mapping and st.button('✅ 확인된 직원 수 DB에 저장', key='pension_headcount_save'):
+                if mapping and _corp_admin_button('✅ 확인된 직원 수 DB에 저장', key='pension_headcount_save'):
                     _pension_target_save_headcount(mapping)
                     if not _db_cloud_push():
                         st.warning('로컬 DB에는 저장했지만 Supabase 동기화가 확인되지 않았습니다. DB 관리에서 영구저장을 재실행하세요.')
@@ -3446,11 +3446,20 @@ def render_pension_target_tab(corp_master):
                                      index=PENSION_LEAD_STAGES.index(current_stage))
                 note = st.text_area('상담메모', value=str(r['상담메모']), height=90)
                 if st.form_submit_button('💾 영업정보 저장', type='primary'):
+                    st.session_state['_corp_pending_contact_payload'] = {
+                        'code': code, 'count_text': count_text, 'stage': stage, 'note': note
+                    }
+                    st.session_state['_corp_admin_pending_action'] = 'pension_contact_save'
+            # form을 닫은 뒤, 비밀번호 인증이 완료된 경우에만 실제 DB 변경
+            if _corp_admin_action_approved('pension_contact_save'):
+                payload = st.session_state.pop('_corp_pending_contact_payload', None)
+                if payload:
                     try:
-                        headcount = _pension_int(count_text)
-                        if count_text.strip() and headcount is None:
+                        headcount = _pension_int(payload['count_text'])
+                        if payload['count_text'].strip() and headcount is None:
                             raise ValueError('종업원 수는 정확한 정수만 입력해 주세요.')
-                        _pension_target_save(code, headcount=headcount, stage=stage, note=note)
+                        _pension_target_save(payload['code'], headcount=headcount,
+                                             stage=payload['stage'], note=payload['note'])
                         if not _db_cloud_push():
                             st.warning('로컬 DB 저장 완료. Supabase 동기화는 실패/미설정 상태이므로 DB 관리에서 별도 확인하세요.')
                         st.success('영업 진행상태·직원 수·메모를 저장했습니다.')
@@ -3488,6 +3497,72 @@ def _corp_logout():
     for key in list(st.session_state):
         del st.session_state[key]
 
+
+def _corp_db_admin_password():
+    # 관리자용 비밀번호는 APP_PASSWORD와 독립적으로 Secrets에서 관리한다.
+    return str(get_secret('ADMIN_PASSWORD', '') or '')
+
+
+def _corp_admin_action_approved(action_key):
+    if st.session_state.get('_corp_admin_approved_action') == action_key:
+        st.session_state.pop('_corp_admin_approved_action', None)
+        return True
+    return False
+
+
+def _corp_admin_button(label, *, key, container=None, **kwargs):
+    """누를 때마다 비밀번호 확인 후 단 한 번만 DB 변경을 허용한다."""
+    target = container if container is not None else st
+    if target.button(label, key=key, **kwargs):
+        st.session_state['_corp_admin_pending_action'] = key
+    return _corp_admin_action_approved(key)
+
+
+@st.dialog('🔐 관리자 비밀번호 확인')
+def _corp_admin_confirm_dialog():
+    action_key = st.session_state.get('_corp_admin_pending_action')
+    if not action_key:
+        return
+    st.caption('이 작업은 저장된 법인 DB를 변경하거나 갱신합니다. 실행할 때마다 관리자 인증이 필요합니다.')
+    expected = _corp_db_admin_password()
+    if not expected:
+        st.error('관리자 비밀번호가 아직 설정되지 않았습니다. Streamlit Cloud → Settings → Secrets에 ADMIN_PASSWORD를 등록해야 DB 변경이 가능합니다.')
+        if st.button('닫기', key='_corp_admin_no_password_close'):
+            st.session_state.pop('_corp_admin_pending_action', None)
+            st.session_state.pop('_corp_pending_contact_payload', None)
+            st.rerun()
+        return
+    blocked_until = float(st.session_state.get('_corp_admin_blocked_until', 0))
+    if time.monotonic() < blocked_until:
+        st.error('비밀번호를 여러 번 잘못 입력했습니다. 잠시 후 다시 시도해 주세요.')
+    else:
+        with st.form('_corp_admin_password_form', clear_on_submit=True):
+            entered = st.text_input('관리자 비밀번호', type='password', autocomplete='off')
+            confirmed = st.form_submit_button('인증 후 실행', type='primary')
+        if confirmed:
+            if hmac.compare_digest(entered.encode('utf-8'), expected.encode('utf-8')):
+                st.session_state['_corp_admin_approved_action'] = action_key
+                st.session_state.pop('_corp_admin_pending_action', None)
+                st.session_state['_corp_admin_failures'] = 0
+                st.rerun()
+            else:
+                failures = int(st.session_state.get('_corp_admin_failures', 0)) + 1
+                st.session_state['_corp_admin_failures'] = failures
+                if failures >= 5:
+                    st.session_state['_corp_admin_blocked_until'] = time.monotonic() + 300
+                    st.session_state['_corp_admin_failures'] = 0
+                st.error('관리자 비밀번호가 일치하지 않습니다.')
+    if st.button('취소', key='_corp_admin_cancel'):
+        st.session_state.pop('_corp_admin_pending_action', None)
+        st.session_state.pop('_corp_pending_contact_payload', None)
+        st.rerun()
+
+
+def _corp_show_pending_admin_dialog():
+    if st.session_state.get('_corp_admin_pending_action'):
+        _corp_admin_confirm_dialog()
+
+
 st.session_state.setdefault('_corp_authenticated',False)
 st.session_state.setdefault('_corp_login_error',False)
 if not _corp_app_password():
@@ -3514,6 +3589,8 @@ with _logout_col:
     st.button('🔒 로그아웃',key='_corp_logout_btn',use_container_width=True,on_click=_corp_logout)
 st.title('🏢 Corporate Finder')
 st.caption('법인명·본점 소재지 검색 · 감사보고서 거래은행/퇴직연금 · 마지막 DB 자동 복원')
+if not _corp_db_admin_password():
+    st.warning('🔐 관리자 비밀번호(ADMIN_PASSWORD)가 미설정입니다. 조회는 가능하지만 DB 저장·갱신·복원은 실행할 수 없습니다.')
 
 # =========================================================
 # 로컬 DB 먼저 실행: 온라인 업데이트는 명시적으로 요청할 때만
@@ -3547,7 +3624,7 @@ if corp_df.empty:
     if st.session_state.get('_db_cloud_error'):
         st.caption('Supabase 자동 복원에 실패했습니다. 아래 버튼으로 재시도하거나 기존 DB를 업로드할 수 있습니다.')
 
-    if st.button('☁️ Supabase 저장 DB 다시 가져오기', key='startup_cloud_restore_retry', type='primary'):
+    if _corp_admin_button('☁️ Supabase 저장 DB 다시 가져오기', key='startup_cloud_restore_retry', type='primary'):
         try:
             with st.spinner('Supabase에 저장된 전체 법인 DB를 가져오는 중입니다...'):
                 result = _db_cloud_restore_on_boot()  # 캐시를 통하지 않는 명시적 재시도
@@ -3560,7 +3637,7 @@ if corp_df.empty:
         except Exception as exc:
             st.error(f'클라우드 DB 복구 실패: {type(exc).__name__}')
 
-    if dart_enabled and st.button('🌐 DART 법인 고유번호 목록 최초 구축', key='startup_dart_master', type='secondary'):
+    if dart_enabled and _corp_admin_button('🌐 DART 법인 고유번호 목록 최초 구축', key='startup_dart_master', type='secondary'):
         try:
             with st.spinner('DART에서 법인 고유번호 목록을 수집하는 중입니다...'):
                 fresh_df = load_corp_codes(api_key)
@@ -3573,13 +3650,14 @@ if corp_df.empty:
             st.error(f'DART 최초 법인목록 구축 실패: {type(exc).__name__}: {exc}')
 
     startup_restore = st.file_uploader('기존 corp_finder_cache.sqlite3 수동 복원', type=['sqlite3', 'db'], key='startup_full_restore')
-    if startup_restore is not None and st.button('업로드한 DB 복원', key='startup_full_restore_btn'):
+    if startup_restore is not None and _corp_admin_button('업로드한 DB 복원', key='startup_full_restore_btn'):
         try:
             restore_full_db_bytes(startup_restore.getvalue())
             st.success('로컬 DB를 복원했습니다. 화면을 새로고침합니다.')
             st.rerun()
         except Exception as exc:
             st.error(f'복원 실패: {type(exc).__name__}: {exc}')
+    _corp_show_pending_admin_dialog()
     st.stop()
 
 _db_cloud_indicator()
@@ -3595,7 +3673,7 @@ if 'external_company_df' not in st.session_state:
 last_db_sync = get_db_meta("corp_master_updated_at", "기존 저장본 (갱신일 기록 없음)")
 mode_label = "오프라인" if not dart_enabled else "로컬 DB 우선"
 st.caption(f"💾 {mode_label} · 저장 법인 {len(corp_df):,}개 · 마지막 법인목록 갱신: {last_db_sync} · DB 위치: {DB_PATH.name}")
-if st.button("🔄 DART 법인목록 최신 업데이트", disabled=not dart_enabled, key="refresh_master_db"):
+if _corp_admin_button("🔄 DART 법인목록 최신 업데이트", disabled=not dart_enabled, key="refresh_master_db"):
     try:
         with st.spinner("DART에서 최신 법인목록을 수집 중입니다. 저장된 DB는 정상 수집 후 갱신합니다..."):
             load_corp_codes.clear()  # 이전 Streamlit 캐시가 아닌 새 DART 목록 요청
@@ -3641,8 +3719,10 @@ with name_tab:
             info = get_saved_company_profile(selected["corp_code"])
             if info is None and dart_enabled:
                 try:
-                    info = get_company_info(api_key, selected["corp_code"])
-                    save_company_profile(selected, info, "")
+                    preview_cache = st.session_state.setdefault('_corp_profile_preview', {})
+                    if selected["corp_code"] not in preview_cache:
+                        preview_cache[selected["corp_code"]] = get_company_info(api_key, selected["corp_code"])
+                    info = preview_cache[selected["corp_code"]]
                 except Exception:
                     pass
 
@@ -3658,9 +3738,9 @@ with name_tab:
 
             _name_c1, _name_c2 = st.columns([2, 1])
             with _name_c1:
-                _name_run = st.button("거래은행 + 퇴직연금 통합 분석", type="primary", key="single_analyze")
+                _name_run = _corp_admin_button("거래은행 + 퇴직연금 통합 분석", type="primary", key="single_analyze")
             with _name_c2:
-                _name_refresh = st.button("🔄 최신 공시 재분석", key="single_analyze_refresh", disabled=not dart_enabled)
+                _name_refresh = _corp_admin_button("🔄 최신 공시 재분석", key="single_analyze_refresh", disabled=not dart_enabled)
             if _name_run or _name_refresh:
                 try:
                     with st.spinner("저장 결과 확인 또는 DART 감사보고서 분석 중입니다..."):
@@ -3758,7 +3838,7 @@ with region_tab:
         quick_batch = qa.selectbox(
             "빠른 주소수집", [50, 100, 200, 300], index=1, key="region_quick_batch"
         )
-        if qb.button("🚀 DART 주소 DB 지금 구축", type="primary", key="region_quick_build", disabled=not dart_enabled):
+        if _corp_admin_button("🚀 DART 주소 DB 지금 구축", type="primary", key="region_quick_build", disabled=not dart_enabled, container=qb):
             ok, fail = build_address_cache(api_key, quick_batch, True, False)
             if ok or fail:
                 st.success(f"주소 DB 구축: 성공 {ok:,}개 / 오류 {fail:,}개")
@@ -3802,64 +3882,67 @@ with region_tab:
             key="external_company_files_multi",
             help="여러 파일을 한 번에 선택하거나 + 버튼으로 추가할 수 있습니다. 기존 DB 목록은 삭제되지 않습니다.",
         )
-        st.caption("새 파일을 추가하면 기존 목록에 누적 저장합니다. 법인명과 사업장 주소가 같은 행은 중복 추가하지 않습니다.")
+        st.caption("추가할 파일을 선택하고 '누적 저장'을 누른 뒤 관리자 비밀번호를 입력하세요. 기존 목록을 유지하며 중복 행을 제외합니다.")
 
         if uploaded_files:
-            already_processed = set(st.session_state.get("external_uploaded_hashes", []))
-            old_df = st.session_state.get("external_company_df")
-            merged_df = old_df.copy() if isinstance(old_df, pd.DataFrame) else pd.DataFrame()
-            saved_mapping = dict(st.session_state.get("external_mapped_cols", {}))
-            stored_info = saved_mapping.get("__파일인식정보__", [])
-            history = ([stored_info] if isinstance(stored_info, dict)
-                       else list(stored_info) if isinstance(stored_info, list) else [])
-            added_total, skipped_total = 0, 0
-            completed_hashes = []
+            st.caption(f"선택한 파일 {len(uploaded_files):,}개 · 관리자 인증 후 DB에 반영됩니다.")
+            if _corp_admin_button("🔐 선택 파일을 기존 DB에 누적 저장", type="primary",
+                                  key="external_files_merge_confirm"):
+                already_processed = set(st.session_state.get("external_uploaded_hashes", []))
+                old_df = st.session_state.get("external_company_df")
+                merged_df = old_df.copy() if isinstance(old_df, pd.DataFrame) else pd.DataFrame()
+                saved_mapping = dict(st.session_state.get("external_mapped_cols", {}))
+                stored_info = saved_mapping.get("__파일인식정보__", [])
+                history = ([stored_info] if isinstance(stored_info, dict)
+                           else list(stored_info) if isinstance(stored_info, list) else [])
+                added_total, skipped_total = 0, 0
+                completed_hashes = []
 
-            for external_upload in uploaded_files:
-                file_hash = hashlib.sha256(external_upload.getvalue()).hexdigest()
-                if file_hash in already_processed or file_hash in completed_hashes:
-                    continue
-                try:
-                    imported_df, mapped = read_external_company_file(external_upload)
-                    previous_count = len(merged_df)
-                    merged_df = merge_external_company_rows(merged_df, imported_df)
-                    added = len(merged_df) - previous_count
-                    added_total += added
-                    skipped_total += len(imported_df) - added
-                    if added:
-                        saved_mapping.update({k: v for k, v in mapped.items() if k != "__파일인식정보__"})
-                        info = dict(mapped.get("__파일인식정보__", {}))
-                        info["추가건수"] = added
-                        history.append(info)
-                    completed_hashes.append(file_hash)
-                except Exception as e:
-                    st.error(f"'{external_upload.name}' 읽기 실패 (기존 자료 유지): {e}")
-
-            if completed_hashes:
-                if added_total:
-                    saved_mapping["__파일인식정보__"] = history
+                for external_upload in uploaded_files:
+                    file_hash = hashlib.sha256(external_upload.getvalue()).hexdigest()
+                    if file_hash in already_processed or file_hash in completed_hashes:
+                        continue
                     try:
-                        # 누적 결합본을 한 번만 저장하여 부분 덮어쓰기를 방지한다.
-                        save_external_company_db(merged_df, saved_mapping)
+                        imported_df, mapped = read_external_company_file(external_upload)
+                        previous_count = len(merged_df)
+                        merged_df = merge_external_company_rows(merged_df, imported_df)
+                        added = len(merged_df) - previous_count
+                        added_total += added
+                        skipped_total += len(imported_df) - added
+                        if added:
+                            saved_mapping.update({k: v for k, v in mapped.items() if k != "__파일인식정보__"})
+                            info = dict(mapped.get("__파일인식정보__", {}))
+                            info["추가건수"] = added
+                            history.append(info)
+                        completed_hashes.append(file_hash)
                     except Exception as e:
-                        st.error(f"외부 기업목록 누적 저장 실패 (기존 저장본 유지): {e}")
+                        st.error(f"'{external_upload.name}' 읽기 실패 (기존 자료 유지): {e}")
+
+                if completed_hashes:
+                    if added_total:
+                        saved_mapping["__파일인식정보__"] = history
+                        try:
+                            # 누적 결합본을 한 번만 저장하여 부분 덮어쓰기를 방지한다.
+                            save_external_company_db(merged_df, saved_mapping)
+                        except Exception as e:
+                            st.error(f"외부 기업목록 누적 저장 실패 (기존 저장본 유지): {e}")
+                        else:
+                            st.session_state["external_company_df"] = merged_df
+                            st.session_state["external_mapped_cols"] = saved_mapping
+                            st.session_state["external_uploaded_hashes"] = list(
+                                already_processed.union(completed_hashes)
+                            )
+                            st.success(
+                                f"신규 {added_total:,}건 추가 · 중복 {skipped_total:,}건 제외 "
+                                f"· 누적 {len(merged_df):,}건 SQLite 저장 완료"
+                            )
+                            if st.session_state.get("_db_cloud_error"):
+                                st.warning("Supabase 클라우드 백업이 실패했습니다. '현재 DB 영구 저장'에서 재시도해 주세요.")
                     else:
-                        st.session_state["external_company_df"] = merged_df
-                        st.session_state["external_mapped_cols"] = saved_mapping
                         st.session_state["external_uploaded_hashes"] = list(
                             already_processed.union(completed_hashes)
                         )
-                        st.success(
-                            f"신규 {added_total:,}건 추가 · 중복 {skipped_total:,}건 제외 "
-                            f"· 누적 {len(merged_df):,}건 SQLite 저장 완료"
-                        )
-                        if st.session_state.get("_db_cloud_error"):
-                            st.warning("Supabase 클라우드 백업이 실패했습니다. '현재 DB 영구 저장'에서 재시도해 주세요.")
-                else:
-                    st.session_state["external_uploaded_hashes"] = list(
-                        already_processed.union(completed_hashes)
-                    )
-                    st.info(f"중복 {skipped_total:,}건 확인 · 기존 저장 목록을 그대로 유지했습니다.")
+                        st.info(f"중복 {skipped_total:,}건 확인 · 기존 저장 목록을 그대로 유지했습니다.")
 
         saved_ext = st.session_state.get("external_company_df")
         if isinstance(saved_ext, pd.DataFrame) and not saved_ext.empty:
@@ -3867,14 +3950,7 @@ with region_tab:
             with st.expander("업로드 파일 및 인식된 열 확인"):
                 st.json(st.session_state.get("external_mapped_cols", {}))
 
-        st.link_button(
-            "📥 2025 충청북도 제조업체 총람 다운로드 페이지",
-            "https://www.chungbuk.go.kr/www/contents.do?key=5382",
-        )
-        st.caption(
-            "사용 순서: 위 페이지에서 '청주시 제조업체총람' 다운로드 → 이 화면의 기업목록에 업로드 → "
-            "청주시/구/읍·면·동 검색. 이 자료는 사업장/공장 소재지 기준이며 DART 본점주소와는 의미가 다를 수 있습니다."
-        )
+        st.caption("외부 기업목록은 사업장·공장 소재지 기준일 수 있으므로 DART 본점주소와는 의미가 다를 수 있습니다.")
 
     st.markdown("#### 지역 조건")
     r1, r2, r3, r4 = st.columns([1.2, 1, 1, 1])
@@ -4006,9 +4082,9 @@ with region_tab:
                 st.info("이 회사를 선택하면 감사보고서에서 거래은행·금융거래 근거와 퇴직연금 관련 공시를 함께 분석합니다.")
                 _rg_c1, _rg_c2, _rg_c3 = st.columns([2.2, 1.2, 1.1])
                 with _rg_c1:
-                    _rg_run = st.button("🏦 거래은행 · 차입금 · 퇴직연금 분석", type="primary", key="region_analyze_btn")
+                    _rg_run = _corp_admin_button("🏦 거래은행 · 차입금 · 퇴직연금 분석", type="primary", key="region_analyze_btn")
                 with _rg_c2:
-                    _rg_refresh = st.button("🔄 최신 공시 재분석", key="region_analyze_refresh", disabled=not dart_enabled)
+                    _rg_refresh = _corp_admin_button("🔄 최신 공시 재분석", key="region_analyze_refresh", disabled=not dart_enabled)
                 with _rg_c3:
                     _rg_diagnose = st.button("🔌 DART 연결 진단", key="region_dart_diagnose", disabled=not dart_enabled)
                 if _rg_run or _rg_refresh:
@@ -4142,7 +4218,7 @@ with bulk_tab:
     )
     st.caption("한 번에 최대 20개 법인을 권장합니다.")
 
-    if st.button("일괄 분석 시작", type="primary", key="bulk_analyze"):
+    if _corp_admin_button("일괄 분석 시작", type="primary", key="bulk_analyze"):
         names = [x.strip() for x in bulk_text.splitlines() if x.strip()]
         names = list(dict.fromkeys(names))[:20]
 
@@ -4262,7 +4338,7 @@ with db_tab:
         key="full_db_export",
     )
     full_restore_file = st.file_uploader("전체 DB 백업파일 복원", type=["sqlite3", "db"], key="full_db_restore_file")
-    if full_restore_file is not None and st.button("전체 DB 복원 실행", key="full_db_restore_btn"):
+    if full_restore_file is not None and _corp_admin_button("전체 DB 복원 실행", key="full_db_restore_btn"):
         try:
             restore_full_db_bytes(full_restore_file.getvalue())
             _db_cloud_push()
@@ -4291,7 +4367,7 @@ with db_tab:
     listed_first = b2.checkbox("상장사 우선", value=True, key="db_listed_first")
     retry_errors = b3.checkbox("오류 회사 재시도 포함", value=False, key="db_retry_errors")
 
-    if st.button("주소 DB 이어서 구축", type="primary", key="db_build_btn", disabled=not dart_enabled):
+    if _corp_admin_button("주소 DB 이어서 구축", type="primary", key="db_build_btn", disabled=not dart_enabled):
         ok, fail = build_address_cache(api_key, batch_size, listed_first, retry_errors)
         if ok == 0 and fail == 0:
             st.success("추가로 수집할 회사가 없습니다.")
@@ -4311,7 +4387,7 @@ with db_tab:
     )
 
     restore_file = st.file_uploader("주소 DB 백업파일 복원", type=["xlsx", "xls", "csv"], key="db_restore_file")
-    if restore_file is not None and st.button("주소 DB 복원 실행", key="db_restore_btn"):
+    if restore_file is not None and _corp_admin_button("주소 DB 복원 실행", key="db_restore_btn"):
         try:
             count = import_address_cache_file(restore_file)
             _db_cloud_push()
@@ -4320,6 +4396,8 @@ with db_tab:
         except Exception as e:
             st.error(f"복원 실패: {e}")
 
+
+_corp_show_pending_admin_dialog()
 
 st.divider()
 st.caption(
