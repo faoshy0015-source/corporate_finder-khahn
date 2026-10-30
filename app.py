@@ -3499,8 +3499,9 @@ def _corp_logout():
 
 
 def _corp_db_admin_password():
-    # 관리자용 비밀번호는 APP_PASSWORD와 독립적으로 Secrets에서 관리한다.
-    return str(get_secret('ADMIN_PASSWORD', '') or '')
+    # 기존 Corporate Finder 로그인 비밀번호(APP_PASSWORD)를 재입력받는다.
+    # 별도 ADMIN_PASSWORD가 이미 등록된 경우에는 해당 값을 우선 사용한다.
+    return str(get_secret('ADMIN_PASSWORD', '') or get_secret('APP_PASSWORD', '') or '')
 
 
 def _corp_admin_action_approved(action_key):
@@ -3526,7 +3527,7 @@ def _corp_admin_confirm_dialog():
     st.caption('이 작업은 저장된 법인 DB를 변경하거나 갱신합니다. 실행할 때마다 관리자 인증이 필요합니다.')
     expected = _corp_db_admin_password()
     if not expected:
-        st.error('관리자 비밀번호가 아직 설정되지 않았습니다. Streamlit Cloud → Settings → Secrets에 ADMIN_PASSWORD를 등록해야 DB 변경이 가능합니다.')
+        st.error('관리자 비밀번호를 확인할 수 없습니다. Streamlit Secrets의 APP_PASSWORD 또는 ADMIN_PASSWORD 설정을 확인해 주세요.')
         if st.button('닫기', key='_corp_admin_no_password_close'):
             st.session_state.pop('_corp_admin_pending_action', None)
             st.session_state.pop('_corp_pending_contact_payload', None)
@@ -3590,7 +3591,7 @@ with _logout_col:
 st.title('🏢 Corporate Finder')
 st.caption('법인명·본점 소재지 검색 · 감사보고서 거래은행/퇴직연금 · 마지막 DB 자동 복원')
 if not _corp_db_admin_password():
-    st.warning('🔐 관리자 비밀번호(ADMIN_PASSWORD)가 미설정입니다. 조회는 가능하지만 DB 저장·갱신·복원은 실행할 수 없습니다.')
+    st.warning('🔐 관리자 비밀번호 설정을 찾을 수 없습니다. APP_PASSWORD 또는 ADMIN_PASSWORD를 확인해 주세요.')
 
 # =========================================================
 # 로컬 DB 먼저 실행: 온라인 업데이트는 명시적으로 요청할 때만
