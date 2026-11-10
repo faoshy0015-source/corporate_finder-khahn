@@ -34,6 +34,11 @@ st.set_page_config(
     layout="wide",
 )
 
+# Email allowlist verification runs before the existing password gate.
+# Until explicitly enabled, the prior APP_PASSWORD flow remains in effect.
+from email_access import require_approved_email
+require_approved_email(st)
+
 
 DART_BASE = "https://opendart.fss.or.kr/api"
 DART_ENG_BASE = "https://engopendart.fss.or.kr/engapi"
