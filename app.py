@@ -34,6 +34,11 @@ st.set_page_config(
     layout="wide",
 )
 
+# When EMAIL_ACCESS_MODE=enforced, verify Supabase Auth identity and central
+# approved email grant before the existing APP_PASSWORD / app data access.
+from approved_email_gate import require_approved_email
+require_approved_email(st, "corporate-finder", "Corporate Finder")
+
 
 DART_BASE = "https://opendart.fss.or.kr/api"
 DART_ENG_BASE = "https://engopendart.fss.or.kr/engapi"
