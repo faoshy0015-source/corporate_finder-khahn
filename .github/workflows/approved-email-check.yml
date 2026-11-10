@@ -1,0 +1,37 @@
+name: Validate Shared Approved Email Gate
+
+on:
+  push:
+    branches: [main, feature/common-approved-email-gate-20261110]
+    paths:
+      - app.py
+      - approved_email_gate.py
+      - tests/test_approved_email_gate.py
+      - requirements.txt
+      - .github/workflows/approved-email-check.yml
+  pull_request:
+    paths:
+      - app.py
+      - approved_email_gate.py
+      - tests/test_approved_email_gate.py
+      - requirements.txt
+      - .github/workflows/approved-email-check.yml
+
+permissions:
+  contents: read
+
+jobs:
+  approved-email-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install testing dependencies
+        run: pip install requests pytest
+      - name: Check application and auth Python syntax
+        run: python -m compileall -q app.py approved_email_gate.py tests/test_approved_email_gate.py
+      - name: Verify Supabase identity, grants and fail-closed behavior
+        run: python -m pytest -q tests/test_approved_email_gate.py
