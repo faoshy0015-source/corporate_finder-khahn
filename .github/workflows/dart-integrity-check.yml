@@ -1,0 +1,27 @@
+name: Verify DART Company and Audit Integrity
+
+on:
+  pull_request:
+    paths:
+      - app.py
+      - dart_integrity.py
+      - tests/test_dart_integrity.py
+      - .github/workflows/dart-integrity-check.yml
+  workflow_dispatch:
+
+jobs:
+  integrity:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compile app and integrity checks
+        run: python -m compileall -q app.py dart_integrity.py tests/test_dart_integrity.py
+      - name: Install pytest
+        run: python -m pip install pytest
+      - name: Run corporate identity and audit report regression tests
+        run: python -m pytest -q tests/test_dart_integrity.py
