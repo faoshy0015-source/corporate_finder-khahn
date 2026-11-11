@@ -40,6 +40,33 @@ from email_access import require_approved_email
 require_approved_email(st)
 
 
+# 공식 제조업체 총람·현황 자료실. 파일 직접 다운로드가 아닌 제공기관 안내 페이지 링크.
+def render_manufacturer_download_links():
+    st.markdown("#### 📂 충북·충남 제조업체 목록 다운로드")
+    st.caption(
+        "공식 제조업체 목록을 내려받아 외부 기업목록으로 추가할 수 있습니다. "
+        "충북은 시·군별 2025년 제조업체총람, 충남은 충청남도 제공 CSV 자료입니다."
+    )
+    cb_col, cn_col = st.columns(2)
+    with cb_col:
+        st.link_button(
+            "📥 충북도청 제조업체총람 (청주 포함)",
+            "https://www.chungbuk.go.kr/www/contents.do?key=5382",
+            use_container_width=True,
+        )
+    with cn_col:
+        st.link_button(
+            "📥 충남 제조업체 현황 (공공데이터)",
+            "https://www.data.go.kr/data/3039901/fileData.do",
+            use_container_width=True,
+        )
+    st.caption(
+        "※ 충남도청 기존 게시판 주소는 접속 오류가 확인되어 공식 공공데이터 제공 페이지로 연결합니다. "
+        "CSV/Excel은 '본점 소재지 검색 → 외부 기업목록(또는 둘 다) → 관리자 인증 후 파일 선택'에서 업로드하세요. "
+        "'전체 DB 복원'에는 제조업체 엑셀을 올리면 안 됩니다."
+    )
+
+
 DART_BASE = "https://opendart.fss.or.kr/api"
 DART_ENG_BASE = "https://engopendart.fss.or.kr/engapi"
 # 실행 위치와 관계없이 app.py와 같은 폴더에 DB를 저장합니다.
@@ -3998,6 +4025,7 @@ with region_tab:
         )
 
     if source_mode in ("외부 기업목록", "둘 다"):
+        render_manufacturer_download_links()
         upload_unlocked = time.monotonic() < float(st.session_state.get("_external_upload_access_expires", 0))
         if not upload_unlocked:
             if _corp_admin_button("🔐 관리자 인증 후 기업목록 파일 선택", key="external_upload_unlock"):
@@ -4464,6 +4492,8 @@ with bulk_tab:
 
 with db_tab:
     st.subheader("DART 본점주소 DB 구축 / 백업")
+    render_manufacturer_download_links()
+    st.divider()
     st.markdown("#### 💾 전체 DB 백업 / 복원 (사내망 PC 이동용)")
     st.caption("법인목록·주소·전화번호·기존 거래은행/퇴직연금 분석 결과를 한 파일로 보관합니다. DB 복원 시 현재 데이터를 대체합니다.")
     st.download_button(
