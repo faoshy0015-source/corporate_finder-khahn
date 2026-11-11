@@ -40,6 +40,8 @@ from email_access import require_approved_email
 require_approved_email(st)
 
 
+from dart_integrity import is_audit_report_title, pick_audit_report_rows, assess_external_dart_match
+
 DART_BASE = "https://opendart.fss.or.kr/api"
 DART_ENG_BASE = "https://engopendart.fss.or.kr/engapi"
 # 실행 위치와 관계없이 app.py와 같은 폴더에 DB를 저장합니다.
@@ -1833,43 +1835,39 @@ def get_company_info(api_key: str, corp_code: str) -> dict:
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_disclosures(api_key: str, corp_code: str, years_back=5) -> pd.DataFrame:
+    """외부감사 공시만 조회. 페이지 누락·오래된 정정본 오인 방지."""
     end = date.today()
     start = end - timedelta(days=365 * years_back + 30)
-
     params = {
         "crtfc_key": api_key,
         "corp_code": corp_code,
         "bgn_de": start.strftime("%Y%m%d"),
         "end_de": end.strftime("%Y%m%d"),
-        "page_no": 1,
+        "pblntf_ty": "F",       # OpenDART 외부감사관련(F001~F005)
+        "last_reprt_at": "Y",   # 정정 전 구보고서 제외
+        "sort": "date",
+        "sort_mth": "desc",
         "page_count": 100,
     }
-    data = request_json(f"{DART_BASE}/list.json", params, timeout=30)
-    items = data.get("list", [])
-    df = pd.DataFrame(items)
-    return df
+    items = []
+    page_no = 1
+    while True:
+        params["page_no"] = page_no
+        data = request_json(f"{DART_BASE}/list.json", params, timeout=30)
+        items.extend(data.get("list") or [])
+        total_pages = int(data.get("total_page") or 1)
+        if total_pages > 20:
+            raise RuntimeError("외부감사 공시가 2,000건을 초과합니다. 불완전한 검색결과로 자동 분석하지 않습니다.")
+        if page_no >= total_pages:
+            break
+        page_no += 1
+    return pd.DataFrame(items)
 
 
 def pick_latest_audit_report(disclosures: pd.DataFrame):
     if disclosures is None or disclosures.empty or "report_nm" not in disclosures.columns:
         return None
-
-    df = disclosures.copy()
-    # 국문/영문 OpenDART 모두 지원
-    audit_pattern = r"감사보고서|audit\s*report|auditor['’]?s?\s*report|independent\s*auditor"
-    mask = df["report_nm"].astype(str).str.contains(
-        audit_pattern, case=False, na=False, regex=True
-    )
-    audit = df[mask].copy()
-
-    if audit.empty:
-        return None
-
-    # 최근 접수일 / 접수번호 기준
-    sort_cols = [c for c in ["rcept_dt", "rcept_no"] if c in audit.columns]
-    if sort_cols:
-        audit = audit.sort_values(sort_cols, ascending=False)
-    return audit.iloc[0].to_dict()
+    return pick_audit_report_rows(disclosures.to_dict("records"))
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -2302,9 +2300,14 @@ def analyze_company(api_key: str, corp_row: dict, *, refresh=False):
             cached, analyzed_at = get_saved_company_analysis(code)
         except Exception:
             pass
-    usable_cache = bool(cached and cached.get("report") and not cached.get("error"))
+    usable_cache = bool(
+        cached and cached.get("report") and not cached.get("error")
+        and is_audit_report_title((cached.get("report") or {}).get("보고서명"))
+    )
 
     if not dart_enabled:
+        if cached is not None and not usable_cache:
+            raise RuntimeError("저장된 공시가 유효한 감사보고서로 확인되지 않습니다. DART 연결 후 최신 공시 재분석이 필요합니다.")
         if cached is None:
             raise RuntimeError("저장된 분석 결과가 없습니다. DART 접속 가능할 때 해당 법인을 먼저 분석해 주세요.")
         st.info(f"오프라인: {analyzed_at} 저장 결과 표시 (최신 공시 미반영)")
@@ -2331,7 +2334,7 @@ def analyze_company(api_key: str, corp_row: dict, *, refresh=False):
         save_company_analysis(result)
         return result
     except Exception as exc:
-        if cached is not None:
+        if usable_cache:
             reason = str(exc) if isinstance(exc, RuntimeError) else _dart_safe_error(exc)
             st.warning(
                 f"DART 최신 조회 실패 ({reason}). "
@@ -4102,6 +4105,9 @@ with region_tab:
     max_rows = st.select_slider("최대 검색 결과", options=[100, 300, 500, 1000, 3000], value=500, key="region_max_rows")
 
     if st.button("🔍 지역 법인 검색", type="primary", key="region_search_btn"):
+        for old_key in ("region_picked_company", "region_analysis_result",
+                        "_last_region_dart_code", "region_dart_match_select"):
+            st.session_state.pop(old_key, None)
         terms = region_terms_from_inputs(province, city, district, town)
         result_frames = []
 
@@ -4180,11 +4186,12 @@ with region_tab:
             idx = selected_indices[0]
             picked = region_results.iloc[idx].to_dict()
             previous = st.session_state.get("region_picked_company") or {}
-            previous_key = (str(previous.get("법인명", "")), str(previous.get("주소", "")))
-            picked_key = (str(picked.get("법인명", "")), str(picked.get("주소", "")))
+            previous_key = tuple(str(previous.get(k, "")) for k in ("출처", "법인명", "주소", "사업자등록번호"))
+            picked_key = tuple(str(picked.get(k, "")) for k in ("출처", "법인명", "주소", "사업자등록번호"))
             if picked_key != previous_key:
-                # 다른 회사를 클릭했는데 직전 회사의 은행 분석 결과가 남아 보이지 않도록 초기화
+                # 다른 행으로 바뀌면 이전 법인 매칭과 분석 결과를 모두 폐기
                 st.session_state.pop("region_analysis_result", None)
+                st.session_state.pop("region_dart_match_select", None)
             st.session_state["region_picked_company"] = picked
 
         picked = st.session_state.get("region_picked_company")
@@ -4207,23 +4214,61 @@ with region_tab:
             if not candidate_rows:
                 st.warning("DART에서 같은 이름의 공시대상 법인을 찾지 못했습니다. 외부 목록의 모든 회사가 DART 공시대상인 것은 아닙니다.")
             else:
-                labels = [company_label(x) for x in candidate_rows]
-                sel_label = st.selectbox("DART 법인 매칭", labels, key="region_dart_match_select")
-                selected_corp = candidate_rows[labels.index(sel_label)]
+                labels = ["(DART 법인을 직접 선택하세요)"] + [company_label(x) for x in candidate_rows]
+                sel_label = st.selectbox("DART 법인 매칭 (자동 확정하지 않음)", labels, key="region_dart_match_select")
+                selected_corp = (candidate_rows[labels.index(sel_label) - 1]
+                                 if sel_label != labels[0] else {"corp_code": "", "corp_name": ""})
                 _selected_code = str(selected_corp.get("corp_code", ""))
                 if st.session_state.get("_last_region_dart_code") != _selected_code:
                     st.session_state.pop("region_analysis_result", None)
                     st.session_state["_last_region_dart_code"] = _selected_code
 
-                st.info("이 회사를 선택하면 감사보고서에서 거래은행·금융거래 근거와 퇴직연금 관련 공시를 함께 분석합니다.")
+                match_ready = bool(_selected_code and picked.get("출처") == "DART")
+                if not _selected_code:
+                    st.warning("자동 법인 매칭을 중단했습니다. 실제 동일 법인임을 확인한 후 선택하세요.")
+                elif picked.get("출처") == "외부목록":
+                    profile = get_saved_company_profile(_selected_code) or {}
+                    if dart_enabled:
+                        try:
+                            live_profile = get_company_info(api_key, _selected_code)
+                            if live_profile:
+                                profile = live_profile
+                        except Exception as exc:
+                            st.caption(f"DART 기업개황 실시간 조회 실패 — 저장 정보 사용: {type(exc).__name__}")
+                    st.markdown("**DART 법인 식별 정보 (외부 목록과 대조)**")
+                    st.write(f"**DART 법인명:** {selected_corp.get('corp_name') or '-'} · **고유번호:** {_selected_code}")
+                    st.write(f"**DART 본점 주소:** {profile.get('adres') or '미확인'}")
+                    st.write(f"**DART 사업자번호:** {profile.get('bizr_no') or '미확인'} / **법인등록번호:** {profile.get('jurir_no') or '미확인'}")
+                    st.caption("외부 목록의 사업장/공장 주소와 DART 본점 주소는 다를 수 있으며, 주소만으로 동일 법인임을 증명할 수 없습니다.")
+                    if not any(profile.get(key) for key in ("adres", "bizr_no", "jurir_no")):
+                        st.error("DART 기업개황을 확인할 수 없어 자동 분석을 차단합니다. DART 연결 후 다시 확인하세요.")
+                    else:
+                        match_status, match_reason = assess_external_dart_match(
+                            picked, selected_corp, profile
+                        )
+                        if match_status == "blocked":
+                            st.error("법인 일치 검증 실패: " + match_reason)
+                        else:
+                            st.warning("동일 법인임을 확인하기 전에는 분석할 수 없습니다. " + match_reason)
+                            fingerprint = hashlib.sha256(
+                                (repr(picked_key) + "|" + _selected_code).encode("utf-8")
+                            ).hexdigest()[:16]
+                            confirmed = st.checkbox(
+                                "외부 기업정보와 DART 기업개황을 대조했고, 동일한 법인임을 확인했습니다.",
+                                value=False, key="region_entity_confirm_" + fingerprint,
+                            )
+                            match_ready = bool(confirmed)
+
+                if match_ready:
+                    st.info("확인한 법인의 외부감사 공시를 분석합니다. 원문 접수번호·기준연도를 확인하세요.")
                 _rg_c1, _rg_c2, _rg_c3 = st.columns([2.2, 1.2, 1.1])
                 with _rg_c1:
-                    _rg_run = st.button("🏦 거래은행 · 차입금 · 퇴직연금 분석", type="primary", key="region_analyze_btn")
+                    _rg_run = st.button("🏦 거래은행 · 차입금 · 퇴직연금 분석", type="primary", key="region_analyze_btn", disabled=not match_ready)
                 with _rg_c2:
-                    _rg_refresh = st.button("🔄 최신 공시 재분석", key="region_analyze_refresh", disabled=not dart_enabled)
+                    _rg_refresh = st.button("🔄 최신 공시 재분석", key="region_analyze_refresh", disabled=(not dart_enabled or not match_ready))
                 with _rg_c3:
-                    _rg_diagnose = st.button("🔌 DART 연결 진단", key="region_dart_diagnose", disabled=not dart_enabled)
-                if _rg_run or _rg_refresh:
+                    _rg_diagnose = st.button("🔌 DART 연결 진단", key="region_dart_diagnose", disabled=(not dart_enabled or not _selected_code))
+                if (_rg_run or _rg_refresh) and match_ready:
                     try:
                         with st.spinner("저장 결과 확인 또는 DART 감사보고서 분석 중입니다..."):
                             result = analyze_company(api_key, selected_corp, refresh=_rg_refresh)
