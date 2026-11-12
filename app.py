@@ -3852,7 +3852,7 @@ with name_tab:
     st.subheader("회사명으로 검색")
     query = st.text_input(
         "법인명",
-        placeholder="예: 다셀주식회사, 우진교통, 신흥기업",
+        placeholder="검색할 법인명을 입력하세요",
         key="single_query",
     )
 
@@ -4377,7 +4377,7 @@ with bulk_tab:
     st.subheader("여러 회사 일괄 분석")
     bulk_text = st.text_area(
         "회사명을 한 줄에 하나씩 입력",
-        placeholder="다셀주식회사\n우진교통\n신흥기업",
+        placeholder="법인명을 한 줄에 하나씩 입력하세요",
         height=170,
     )
     st.caption("한 번에 최대 20개 법인을 권장합니다.")
