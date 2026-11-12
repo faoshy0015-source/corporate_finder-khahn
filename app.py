@@ -82,15 +82,15 @@ st.markdown(
     """
     <style>
     .bank-note {
-        background: #f7f9fc;
-        border: 1px solid #e1e6ef;
+        background: #F4FBF7;
+        border: 1px solid #CEE2D5;
         border-left: 5px solid #ff4b4b;
         border-radius: 8px;
         padding: 12px 14px;
         margin: 8px 0 12px 0;
         line-height: 1.55;
         font-size: 0.97rem;
-        color: #1f2937;
+        color: #203D35;
         white-space: pre-wrap;
     }
     .bank-meta {
@@ -103,11 +103,11 @@ st.markdown(
         display: inline-block;
         padding: 4px 9px;
         border-radius: 999px;
-        background: #eef2f7;
-        border: 1px solid #dde3ec;
+        background: #EAF6EF;
+        border: 1px solid #CEE2D8;
         font-size: 0.86rem;
         font-weight: 650;
-        color: #273142;
+        color: #244C40;
     }
     </style>
     """,
@@ -2538,7 +2538,7 @@ def make_visit_report_excel(result, external_meta=None):
     ws.sheet_view.zoomScale = 85
     for i,w in enumerate([12,12,13,13,13,13,12,12],1):
         ws.column_dimensions[get_column_letter(i)].width = w
-    navy='18354F'; teal='008879'; dark='253849'; mid='526679'; light='EDF4F4'; white='FFFFFF'; grey='F2F5F7'; orange='FFF7E8'; line='D8E3E7'
+    navy='0B5045'; teal='008879'; dark='234B40'; mid='58796C'; light='E7F5ED'; white='FFFFFF'; grey='F2F9F5'; orange='FFF7E8'; line='CCE0D4'
     edge=Side(style='thin', color=line)
 
     def cellrow(row,text, start=1,end=8, *, height=20, size=10, color=dark,
@@ -2671,9 +2671,9 @@ def make_visit_report_pdf(result, external_meta=None):
     buf=io.BytesIO()
     pdf=canvas.Canvas(buf,pagesize=A4,pageCompression=1)
     pdf.setTitle(f"{d['name']} - 법인 현장 미팅 보고서")
-    navy=HexColor('#18354F'); teal=HexColor('#008879'); ink=HexColor('#253849')
-    mute=HexColor('#627485'); pale=HexColor('#EDF4F4'); grey=HexColor('#F2F5F7')
-    stroke=HexColor('#D8E3E7'); cream=HexColor('#FFF7E8')
+    navy=HexColor('#0B5045'); teal=HexColor('#008879'); ink=HexColor('#234B40')
+    mute=HexColor('#607D70'); pale=HexColor('#E7F5ED'); grey=HexColor('#F2F9F5')
+    stroke=HexColor('#CCE0D4'); cream=HexColor('#FFF7E8')
     margin=29; right=w-margin; inner_w=w-2*margin
 
     def box(top,height,color,rad=0,x=margin,width=inner_w,border=None):
@@ -2704,7 +2704,7 @@ def make_visit_report_pdf(result, external_meta=None):
     text(margin,18,'CORPORATE FINDER  /  FIELD BRIEF',size=9,color=teal,weight=True)
     box(37,43,navy,rad=4)
     text(margin+15,45,'법인 분석 요약 보고서',size=17,color=HexColor('#FFFFFF'),weight=True)
-    text(right-139,62,f"작성 {d['generated']}",size=8,color=HexColor('#D3E5E5'))
+    text(right-139,62,f"작성 {d['generated']}",size=8,color=HexColor('#D7F1E3'))
     section(90,'01','기업 기본정보')
     box(111,65,grey,rad=5)
     text(margin+12,115,'회사명',size=8,color=mute)
@@ -2770,14 +2770,14 @@ def _visit_report_preview_html(d):
     ) or '<tr><td colspan="4">보고서에서 금융기관 근거를 확인하지 못했습니다.</td></tr>'
     more=(f'<small>외 {len(d["banks"])-4}개 금융기관: 상세 분석 참조</small>' if len(d['banks'])>4 else '')
     return f"""<!doctype html><html lang="ko"><meta charset="utf-8"><style>
-    *{{box-sizing:border-box}}body{{margin:0;padding:14px;background:#eaf0f1;font-family:"Malgun Gothic","Noto Sans KR",sans-serif;color:#253849}}
+    *{{box-sizing:border-box}}body{{margin:0;padding:14px;background:#EAF6EF;font-family:"Malgun Gothic","Noto Sans KR",sans-serif;color:#234B40}}
     article{{max-width:710px;margin:auto;background:white;min-height:870px;padding:26px;box-shadow:0 2px 12px #82909830}}
-    header{{background:#18354f;color:white;padding:18px 20px;border-radius:6px}}header strong{{font-size:23px}}header div{{font-size:12px;margin-top:5px;opacity:.87}}
-    h3{{font-size:14px;margin:18px 0 7px;color:#008879}}.basics{{display:grid;grid-template-columns:1fr 1fr;gap:5px 13px;background:#f2f5f7;border-radius:5px;padding:12px;font-size:11px}}
-    .wide{{grid-column:span 2}}table{{border-collapse:collapse;width:100%;font-size:11px}}th{{background:#18354f;color:white}}td,th{{text-align:left;padding:9px;border-bottom:1px solid #d8e3e7}}tr:nth-child(even){{background:#f2f5f7}}
-    .pension{{background:#edf4f4;padding:12px;font-size:11px;line-height:1.8;border-radius:5px}}
-    .memo{{height:265px;border:1px solid #d8e3e7;border-radius:5px;padding:10px 14px}}.memo b{{display:block;color:#008879;margin:8px 0}}.lines{{height:45px;background:repeating-linear-gradient(to bottom,transparent 0px,transparent 19px,#d8e3e7 20px,#d8e3e7 21px)}}
-    footer{{font-size:10px;color:#627485;margin-top:11px}}
+    header{{background:#0B5045;color:white;padding:18px 20px;border-radius:6px}}header strong{{font-size:23px}}header div{{font-size:12px;margin-top:5px;opacity:.87}}
+    h3{{font-size:14px;margin:18px 0 7px;color:#008879}}.basics{{display:grid;grid-template-columns:1fr 1fr;gap:5px 13px;background:#F2F9F5;border-radius:5px;padding:12px;font-size:11px}}
+    .wide{{grid-column:span 2}}table{{border-collapse:collapse;width:100%;font-size:11px}}th{{background:#0B5045;color:white}}td,th{{text-align:left;padding:9px;border-bottom:1px solid #CCE0D4}}tr:nth-child(even){{background:#F2F9F5}}
+    .pension{{background:#E7F5ED;padding:12px;font-size:11px;line-height:1.8;border-radius:5px}}
+    .memo{{height:265px;border:1px solid #CCE0D4;border-radius:5px;padding:10px 14px}}.memo b{{display:block;color:#008879;margin:8px 0}}.lines{{height:45px;background:repeating-linear-gradient(to bottom,transparent 0px,transparent 19px,#CCE0D4 20px,#CCE0D4 21px)}}
+    footer{{font-size:10px;color:#607D70;margin-top:11px}}
     </style><body><article><header><strong>법인 분석 요약 보고서</strong><div>{esc(d['name'])} · {esc(d['generated'])}</div></header>
     <h3>01 기업 기본정보</h3><div class="basics"><div>대표자 : {esc(d['ceo'])}</div><div>전화번호 : {esc(d['phone'])}</div>
     <div>사업자번호 : {esc(d['bizno'])}</div><div>법인등록번호 : {esc(d['jurino'])}</div>
@@ -3506,11 +3506,19 @@ def render_pension_target_tab(corp_master):
 # =========================================================
 st.markdown("""
 <style>
-:root {color-scheme:light;--primary-color:#008878;--background-color:#F4F8F7}
+:root {color-scheme:light;--primary-color:#008878;--background-color:#F4F8F7;--secondary-background-color:#E7F5ED;--text-color:#203D35}
 .stApp,[data-testid="stAppViewContainer"]{background:#F4F8F7;color:#203D35}
 .block-container{max-width:1500px;padding-top:1rem}
 input{color:#203D35!important}
+input[type="checkbox"],input[type="radio"]{accent-color:#008878}
 .stButton>button[kind="primary"]{background:#008878!important;border-color:#008878!important;color:white!important}
+.stButton>button[kind="primary"]:hover{background:#006F57!important;border-color:#006F57!important}
+.stButton>button[kind="secondary"],.stDownloadButton>button,.stLinkButton>a{border-color:#BDDBCC!important;color:#205447!important}
+.stButton>button[kind="secondary"]:hover,.stDownloadButton>button:hover,.stLinkButton>a:hover{border-color:#008878!important;color:#006F57!important;background:#F0FAF4!important}
+.stTabs [data-baseweb="tab"][aria-selected="true"]{color:#006F57!important}
+.stTabs [data-baseweb="tab-highlight"]{background-color:#008878!important}
+[data-baseweb="input"]:focus-within,[data-baseweb="textarea"]:focus-within,[data-baseweb="select"]:focus-within{border-color:#008878!important;box-shadow:0 0 0 1px rgba(0,136,120,.13)}
+[data-testid="stExpander"]{border-color:#CEE2D8!important}
 </style>
 """,unsafe_allow_html=True)
 
@@ -3631,7 +3639,7 @@ if not st.session_state['_corp_authenticated']:
 _, _logout_col=st.columns([5,1])
 with _logout_col:
     st.button('🔒 로그아웃',key='_corp_logout_btn',use_container_width=True,on_click=_corp_logout)
-# Corporate Finder · Modern Fintech (선택 시안 2) — 헤더에만 디자인 적용
+# Corporate Finder · cohesive emerald/mint design system
 st.markdown("""
 <style>
 .cf-brand-header {
@@ -3639,21 +3647,21 @@ st.markdown("""
     display: flex; align-items: center; gap: 26px;
     min-height: 164px; padding: 23px 31px;
     margin: 2px 0 22px 0; border-radius: 22px;
-    border: 1px solid rgba(115, 187, 230, .26);
-    background: linear-gradient(110deg, #f0f9ff 0%, #f8fcff 53%, #eaf6ff 100%);
-    box-shadow: 0 10px 32px rgba(30, 82, 143, .055);
+    border: 1px solid rgba(34, 151, 114, .28);
+    background: linear-gradient(110deg, #E7F7EF 0%, #F6FCF8 53%, #DDF2E6 100%);
+    box-shadow: 0 10px 32px rgba(11, 107, 82, .075);
 }
 .cf-brand-header::before {
     content: ""; position: absolute; z-index: -1; inset: 0;
     background:
-        radial-gradient(ellipse at 90% 12%, rgba(87, 190, 255, .20), transparent 35%),
-        radial-gradient(ellipse at 8% 85%, rgba(43, 205, 208, .11), transparent 32%);
+        radial-gradient(ellipse at 90% 12%, rgba(53, 191, 139, .19), transparent 35%),
+        radial-gradient(ellipse at 8% 85%, rgba(50, 181, 143, .10), transparent 32%);
     pointer-events: none;
 }
 .cf-brand-header::after {
     content: ""; position: absolute; z-index: -1;
     width: 350px; height: 210px; right: -48px; top: -100px;
-    border: 2px solid rgba(111, 205, 255, .22);
+    border: 2px solid rgba(44, 170, 127, .22);
     transform: rotate(-21deg); border-radius: 50%;
     pointer-events: none;
 }
@@ -3662,9 +3670,9 @@ st.markdown("""
     width: 114px; height: 114px; display: flex;
     align-items: center; justify-content: center;
     border-radius: 24px;
-    background: linear-gradient(140deg, rgba(255,255,255,.94), rgba(200,236,255,.62));
+    background: linear-gradient(140deg, rgba(255,255,255,.94), rgba(197, 237, 215, .72));
     border: 1px solid rgba(255,255,255,.97);
-    box-shadow: 0 7px 24px rgba(36,135,206,.13), inset 0 0 0 1px rgba(123,210,255,.27);
+    box-shadow: 0 7px 24px rgba(13, 129, 94, .13), inset 0 0 0 1px rgba(45, 180, 132, .23);
 }
 .cf-brand-icon svg { width: 100px; height: 100px; display: block; }
 .cf-brand-copy { position: relative; z-index: 1; min-width: 0; }
@@ -3672,24 +3680,24 @@ st.markdown("""
     font-family: "Inter", "Pretendard", "Noto Sans KR", sans-serif;
     font-size: clamp(30px, 3.6vw, 49px);
     font-weight: 830; line-height: 1.12; letter-spacing: -.052em;
-    color: #142b50; margin: 0 0 10px;
+    color: #123F36; margin: 0 0 10px;
 }
 .cf-brand-title span {
     display: inline-block; white-space: nowrap;
     font-style: italic; font-weight: 820; letter-spacing: -.045em;
     /* Italic glyphs overhang the final letter; keep extra paint width. */
     padding-right: .23em; margin-right: -.13em;
-    background: linear-gradient(100deg, #2457de 5%, #119fd4 93%);
+    background: linear-gradient(100deg, #006F57 5%, #16A780 93%);
     -webkit-background-clip: text; background-clip: text; color: transparent;
 }
 .cf-brand-desc {
     font-size: clamp(12px, 1.1vw, 15px); font-weight: 500;
-    color: #65798e; letter-spacing: -.015em; line-height: 1.5;
+    color: #577B6C; letter-spacing: -.015em; line-height: 1.5;
 }
 .cf-brand-decoration {
     position: absolute; width: 200px; height: 120px; right: 46px; bottom: 6px;
     opacity: .12; z-index: 0; pointer-events: none;
-    background: repeating-linear-gradient(90deg, transparent 0 18px, #55a7de 18px 22px, transparent 22px 35px);
+    background: repeating-linear-gradient(90deg, transparent 0 18px, #61B899 18px 22px, transparent 22px 35px);
     clip-path: polygon(12% 38%, 37% 38%, 37% 4%, 63% 4%, 63% 29%, 85% 29%, 85% 100%, 12% 100%);
 }
 @media (max-width: 640px) {
@@ -3706,29 +3714,29 @@ st.markdown("""
     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 112 112">
       <defs>
         <linearGradient id="cf-tower-one" x1="0" y1="0" x2="1" y2="1">
-          <stop offset="0" stop-color="#5cdfff"/><stop offset="1" stop-color="#1688dc"/>
+          <stop offset="0" stop-color="#8EE5C2"/><stop offset="1" stop-color="#20AA80"/>
         </linearGradient>
         <linearGradient id="cf-tower-two" x1="0" y1="0" x2="1" y2="1">
-          <stop offset="0" stop-color="#174d9c"/><stop offset="1" stop-color="#092e68"/>
+          <stop offset="0" stop-color="#147660"/><stop offset="1" stop-color="#0B5045"/>
         </linearGradient>
         <linearGradient id="cf-search-lens" x1="0" y1="0" x2="1" y2="1">
-          <stop offset="0" stop-color="#79efff"/><stop offset="1" stop-color="#1496e6"/>
+          <stop offset="0" stop-color="#BBF3DC"/><stop offset="1" stop-color="#169977"/>
         </linearGradient>
         <filter id="cf-logo-shadow" x="-30%" y="-30%" width="170%" height="170%">
-          <feDropShadow dx="1" dy="3" stdDeviation="2.5" flood-color="#1e6dac" flood-opacity=".23"/>
+          <feDropShadow dx="1" dy="3" stdDeviation="2.5" flood-color="#0B6654" flood-opacity=".23"/>
         </filter>
       </defs>
       <g filter="url(#cf-logo-shadow)">
         <path d="M15 38 43 26 43 93 15 93Z" fill="url(#cf-tower-one)"/>
         <path d="M43 16 73 5 73 93 43 93Z" fill="url(#cf-tower-two)"/>
-        <path d="M73 25 90 34 90 93 73 93Z" fill="#51d9ef"/>
-        <path d="M20 46 36 40 M20 57 36 51 M20 68 36 62 M20 79 36 73" stroke="#e5fbff" stroke-width="4" opacity=".88"/>
-        <path d="M51 29 65 24 M51 42 65 37 M51 55 65 50 M51 68 65 63" stroke="#82eaff" stroke-width="4" opacity=".83"/>
-        <path d="M78 41 85 44 M78 53 85 56 M78 65 85 68" stroke="#e8ffff" stroke-width="3"/>
+        <path d="M73 25 90 34 90 93 73 93Z" fill="#44C69F"/>
+        <path d="M20 46 36 40 M20 57 36 51 M20 68 36 62 M20 79 36 73" stroke="#EEFFF5" stroke-width="4" opacity=".88"/>
+        <path d="M51 29 65 24 M51 42 65 37 M51 55 65 50 M51 68 65 63" stroke="#C1F4DC" stroke-width="4" opacity=".83"/>
+        <path d="M78 41 85 44 M78 53 85 56 M78 65 85 68" stroke="#F1FFF8" stroke-width="3"/>
       </g>
-      <circle cx="74" cy="70" r="23" fill="#ebfbff" fill-opacity=".94" stroke="url(#cf-search-lens)" stroke-width="9"/>
-      <path d="M90 87 105 103" stroke="#1b5ea5" stroke-width="10" stroke-linecap="round"/>
-      <path d="M90 87 105 103" stroke="#37cbea" stroke-width="4" stroke-linecap="round" opacity=".85"/>
+      <circle cx="74" cy="70" r="23" fill="#ECFCF3" fill-opacity=".94" stroke="url(#cf-search-lens)" stroke-width="9"/>
+      <path d="M90 87 105 103" stroke="#0D604E" stroke-width="10" stroke-linecap="round"/>
+      <path d="M90 87 105 103" stroke="#70DBB2" stroke-width="4" stroke-linecap="round" opacity=".85"/>
       <path d="M63 59q9-9 20-3" fill="none" stroke="#ffffff" stroke-width="3" stroke-linecap="round" opacity=".73"/>
     </svg>
   </div>
